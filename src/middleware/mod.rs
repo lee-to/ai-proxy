@@ -63,15 +63,7 @@ impl ScanMatch {
 
 pub fn category_for_pattern(pattern_name: &str) -> String {
     let normalized = pattern_name.to_ascii_lowercase();
-    if normalized.contains("email") {
-        "email".to_string()
-    } else if normalized.contains("person") || normalized.contains("name") {
-        "person_name".to_string()
-    } else if normalized.contains("phone") {
-        "phone".to_string()
-    } else if normalized.contains("jwt") {
-        "jwt".to_string()
-    } else if normalized.contains("private_key") {
+    if normalized.contains("private_key") {
         "private_key".to_string()
     } else if normalized.contains("connection") || normalized.contains("database_url") {
         "connection_string".to_string()
@@ -82,10 +74,21 @@ pub fn category_for_pattern(pattern_name: &str) -> String {
         || normalized.contains("secret_key")
     {
         "api_key".to_string()
+    } else if normalized.contains("jwt") {
+        "jwt".to_string()
     } else if normalized.contains("token") {
         "token".to_string()
-    } else if normalized.contains("secret") || normalized.contains("entropy") {
+    } else if normalized.contains("secret")
+        || normalized.contains("entropy")
+        || normalized.contains("session")
+    {
         "generic_secret".to_string()
+    } else if normalized.contains("email") {
+        "email".to_string()
+    } else if normalized.contains("person") || normalized.contains("name") {
+        "person_name".to_string()
+    } else if normalized.contains("phone") {
+        "phone".to_string()
     } else {
         "generic_secret".to_string()
     }
@@ -139,6 +142,18 @@ impl ScanPipeline {
 
     /// Run all scanners on the text, deduplicating by exact span and resolving overlaps.
     pub fn scan(&self, text: &str) -> Vec<ScanMatch> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current()
+            && matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        {
+            return tokio::task::block_in_place(|| self.scan_inner(text));
+        }
+        self.scan_inner(text)
+    }
+
+    fn scan_inner(&self, text: &str) -> Vec<ScanMatch> {
         debug!(
             text_len = text.len(),
             scanner_count = self.scanners.len(),
@@ -175,7 +190,7 @@ impl ScanPipeline {
             }
         }
 
-        let results = normalize_findings(candidates);
+        let results = normalize_findings(candidates, text);
         let mut totals: BTreeMap<String, usize> = BTreeMap::new();
         for m in &results {
             *totals.entry(m.category.clone()).or_default() += 1;
@@ -195,7 +210,7 @@ impl Default for ScanPipeline {
     }
 }
 
-fn normalize_findings(candidates: Vec<(usize, ScanMatch)>) -> Vec<ScanMatch> {
+fn normalize_findings(candidates: Vec<(usize, ScanMatch)>, text: &str) -> Vec<ScanMatch> {
     let mut seen_exact: HashSet<(usize, usize, String)> = HashSet::new();
     let mut unique = Vec::new();
 
@@ -214,28 +229,48 @@ fn normalize_findings(candidates: Vec<(usize, ScanMatch)>) -> Vec<ScanMatch> {
     }
 
     unique.sort_by(|(left_ordinal, left), (right_ordinal, right)| {
-        right
-            .confidence
-            .partial_cmp(&left.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| (right.end - right.start).cmp(&(left.end - left.start)))
-            .then_with(|| left.start.cmp(&right.start))
+        left.start
+            .cmp(&right.start)
+            .then_with(|| right.end.cmp(&left.end))
             .then_with(|| left_ordinal.cmp(right_ordinal))
     });
 
     let mut accepted: Vec<(usize, ScanMatch)> = Vec::new();
     for (ordinal, candidate) in unique {
-        if accepted.iter().any(|(_, existing)| {
-            spans_overlap(candidate.start, candidate.end, existing.start, existing.end)
-        }) {
-            warn!(
-                scanner = %candidate.scanner,
-                category = %candidate.category,
-                confidence = candidate.confidence,
-                start = candidate.start,
-                end = candidate.end,
-                "Dropping overlapping scanner finding"
+        if let Some((existing_ordinal, existing)) = accepted.last_mut()
+            && spans_overlap(candidate.start, candidate.end, existing.start, existing.end)
+        {
+            let start = existing.start.min(candidate.start);
+            let end = existing.end.max(candidate.end);
+            let Some(value) = text.get(start..end) else {
+                warn!(
+                    start,
+                    end,
+                    "Skipping overlapping scanner finding union because span is not UTF-8 aligned"
+                );
+                continue;
+            };
+            debug!(
+                existing_category = %existing.category,
+                candidate_category = %candidate.category,
+                start,
+                end,
+                "Merging overlapping scanner findings"
             );
+            existing.value = value.to_string();
+            existing.start = start;
+            existing.end = end;
+            existing.confidence = existing.confidence.max(candidate.confidence);
+            if existing.sensitivity_class == "secret"
+                || candidate.sensitivity_class == "secret"
+                || existing.restore_policy == RESTORE_POLICY_NEVER
+                || candidate.restore_policy == RESTORE_POLICY_NEVER
+            {
+                existing.category = "generic_secret".to_string();
+                existing.sensitivity_class = "secret".to_string();
+                existing.restore_policy = RESTORE_POLICY_NEVER.to_string();
+            }
+            *existing_ordinal = (*existing_ordinal).min(ordinal);
             continue;
         }
         accepted.push((ordinal, candidate));
@@ -275,9 +310,38 @@ mod tests {
             ),
         ];
 
-        let normalized = normalize_findings(findings);
+        let normalized = normalize_findings(findings, "abcdef");
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].start, 0);
         assert_eq!(normalized[0].end, 6);
+    }
+
+    #[test]
+    fn normalizes_overlapping_findings_to_union_span() {
+        let findings = vec![
+            (
+                0,
+                ScanMatch::new("abc".to_string(), "regex", "person_name", 0, 3, 0.70),
+            ),
+            (
+                1,
+                ScanMatch::new("cdef".to_string(), "entropy", "generic_secret", 2, 6, 0.80),
+            ),
+        ];
+
+        let normalized = normalize_findings(findings, "abcdef");
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].value, "abcdef");
+        assert_eq!(normalized[0].start, 0);
+        assert_eq!(normalized[0].end, 6);
+        assert_eq!(normalized[0].category, "generic_secret");
+    }
+
+    #[test]
+    fn category_mapping_prioritizes_secret_markers_over_name() {
+        assert_eq!(category_for_pattern("username_token"), "token");
+        assert_eq!(category_for_pattern("session_name"), "generic_secret");
+        assert_eq!(category_for_pattern("customer_name"), "person_name");
     }
 }

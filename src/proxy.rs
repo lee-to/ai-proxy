@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -146,20 +147,33 @@ async fn handle_connect(state: Arc<AppState>, req: Request<Body>) -> Result<Resp
     info!(target = %authority, host = %host, mitm = use_mitm, "CONNECT tunnel requested");
 
     tokio::spawn(async move {
-        match hyper::upgrade::on(req).await {
-            Ok(upgraded) => {
+        let upgrade_timeout = Duration::from_secs(state.config.proxy.connect_timeout_secs.max(1));
+        let connect_timeout_secs = state.config.proxy.connect_timeout_secs;
+        let request_timeout_secs = state.config.proxy.request_timeout_secs;
+        match tokio::time::timeout(upgrade_timeout, hyper::upgrade::on(req)).await {
+            Err(_) => {
+                warn!(target = %authority, timeout_secs = upgrade_timeout.as_secs(), "CONNECT upgrade timed out");
+            }
+            Ok(Err(error)) => {
+                warn!(target = %authority, error = %error, "CONNECT upgrade failed");
+            }
+            Ok(Ok(upgraded)) => {
                 if use_mitm {
                     if let Err(error) =
                         tunnel_mitm_connection(state, upgraded, authority.clone()).await
                     {
                         warn!(target = %authority, error = %error, "CONNECT MITM session failed");
                     }
-                } else if let Err(error) = tunnel_upgraded_connection(upgraded, &authority).await {
+                } else if let Err(error) = tunnel_upgraded_connection(
+                    upgraded,
+                    &authority,
+                    connect_timeout_secs,
+                    request_timeout_secs,
+                )
+                .await
+                {
                     log_connect_tunnel_error(&authority, &error);
                 }
-            }
-            Err(error) => {
-                warn!(target = %authority, error = %error, "CONNECT upgrade failed");
             }
         }
     });
@@ -199,7 +213,9 @@ async fn forward_request(
         &body_bytes,
         allow_normalization,
         force_codex_store_false,
-    ) {
+    )
+    .await
+    {
         Ok(body) => body,
         Err(status) => return Err(status),
     };
@@ -247,21 +263,31 @@ async fn forward_request(
     let (forwarded_headers, final_upstream_url) =
         if state.config.scanner.enabled && state.config.scanner.scan_scope == "full" {
             let scanned_headers =
-                scan_and_redact_headers(state, &headers, &request_id, &mut processed_body.context);
+                scan_and_redact_headers(state, &headers, &request_id, &mut processed_body.context)
+                    .await;
             let redacted_url = scan_and_redact_query_params(
                 state,
                 &upstream_url,
                 &request_id,
                 &mut processed_body.context,
-            );
+            )
+            .await;
             (scanned_headers, redacted_url)
         } else {
             (headers.clone(), upstream_url)
         };
 
+    let reqwest_method = match reqwest_method(&method) {
+        Ok(method) => method,
+        Err(()) => {
+            warn!(request_id = %request_id, method = %method, "Unsupported HTTP method");
+            persist_request_finish(state, &request_id, None, Some("unsupported HTTP method")).await;
+            return Err(StatusCode::NOT_IMPLEMENTED);
+        }
+    };
     let mut upstream_req = state
         .http_client
-        .request(reqwest_method(&method), &final_upstream_url);
+        .request(reqwest_method, &final_upstream_url);
 
     upstream_req = forward_headers(
         upstream_req,
@@ -306,7 +332,6 @@ async fn response_from_upstream(
     redaction_context: RedactionContext,
 ) -> Result<Response, StatusCode> {
     let request_id = telemetry_context.request_id.clone();
-    let telemetry_store = state.telemetry_store.clone();
     info!(
         request_id = %request_id,
         mode,
@@ -316,22 +341,15 @@ async fn response_from_upstream(
 
     let status = axum::http::StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    if let Some(store) = telemetry_store.as_ref()
-        && let Err(error) = store
-            .finish_request(&request_id, now_ms(), Some(status.as_u16()), None)
-            .await
-    {
-        warn!(
-            request_id = %request_id,
-            error = %error,
-            "Failed to finish telemetry request"
-        );
-    }
-
     let mut response_headers = HeaderMap::new();
     let response_content_type = upstream_resp
         .headers()
         .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let response_content_encoding = upstream_resp
+        .headers()
+        .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
     for (name, value) in upstream_resp.headers() {
@@ -357,23 +375,37 @@ async fn response_from_upstream(
         })
     });
     let stream: ResponseByteStream = Box::pin(stream);
-    let stream: ResponseByteStream = if stateful_restore_enabled(&redaction_context) {
-        debug!(
-            request_id = %request_id,
-            mode,
-            placeholder_count_empty = redaction_context.is_empty(),
-            "Response placeholder restoration enabled"
-        );
-        Box::pin(restore_response_stream(stream, redaction_context))
-    } else {
-        debug!(
-            request_id = %request_id,
-            mode,
-            "Response placeholder restoration disabled"
-        );
-        stream
-    };
-    let stream = telemetry_stream(stream, state, telemetry_context, response_content_type);
+    let restore_allowed = response_restore_allowed(
+        response_content_type.as_deref(),
+        response_content_encoding.as_deref(),
+    );
+    let stream: ResponseByteStream =
+        if restore_allowed && stateful_restore_enabled(&redaction_context) {
+            debug!(
+                request_id = %request_id,
+                mode,
+                placeholder_count_empty = redaction_context.is_empty(),
+                "Response placeholder restoration enabled"
+            );
+            Box::pin(restore_response_stream(stream, redaction_context))
+        } else {
+            debug!(
+                request_id = %request_id,
+                mode,
+                content_type = ?response_content_type,
+                content_encoding = ?response_content_encoding,
+                restore_allowed,
+                "Response placeholder restoration disabled"
+            );
+            stream
+        };
+    let stream = telemetry_stream(
+        stream,
+        state,
+        telemetry_context,
+        response_content_type,
+        status.as_u16(),
+    );
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -384,6 +416,38 @@ async fn response_from_upstream(
 
 fn stateful_restore_enabled(context: &RedactionContext) -> bool {
     !context.is_empty()
+}
+
+fn response_restore_allowed(content_type: Option<&str>, content_encoding: Option<&str>) -> bool {
+    if content_encoding
+        .map(|value| {
+            value.split(',').map(str::trim).any(|encoding| {
+                matches!(
+                    encoding.to_ascii_lowercase().as_str(),
+                    "gzip" | "br" | "zstd" | "deflate"
+                )
+            })
+        })
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    let mime = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime.ends_with("+json")
+        || mime == "application/x-ndjson"
+        || mime == "text/event-stream"
 }
 
 fn restore_response_stream(
@@ -436,6 +500,7 @@ fn telemetry_stream(
     state: Arc<AppState>,
     context: RequestTelemetryContext,
     content_type: Option<String>,
+    status_code: u16,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     let telemetry_store = state.telemetry_store.clone();
     let collector = telemetry_store.as_ref().map(|_| {
@@ -455,8 +520,19 @@ fn telemetry_stream(
     };
 
     futures_util::stream::unfold(
-        (stream, collector, capture, state, context, content_type),
-        |(mut stream, mut collector, mut capture, state, context, content_type)| async move {
+        (
+            stream,
+            collector,
+            capture,
+            state,
+            context,
+            content_type,
+            false,
+        ),
+        move |(mut stream, mut collector, mut capture, state, context, content_type, finished)| async move {
+            if finished {
+                return None;
+            }
             match stream.next().await {
                 Some(Ok(bytes)) => {
                     if let Some(collector) = collector.as_mut() {
@@ -467,13 +543,38 @@ fn telemetry_stream(
                     }
                     Some((
                         Ok(bytes),
-                        (stream, collector, capture, state, context, content_type),
+                        (
+                            stream,
+                            collector,
+                            capture,
+                            state,
+                            context,
+                            content_type,
+                            false,
+                        ),
                     ))
                 }
-                Some(Err(error)) => Some((
-                    Err(error),
-                    (stream, collector, capture, state, context, content_type),
-                )),
+                Some(Err(error)) => {
+                    persist_request_finish(
+                        &state,
+                        &context.request_id,
+                        Some(status_code),
+                        Some("upstream response stream error"),
+                    )
+                    .await;
+                    Some((
+                        Err(error),
+                        (
+                            stream,
+                            collector,
+                            capture,
+                            state,
+                            context,
+                            content_type,
+                            true,
+                        ),
+                    ))
+                }
                 None => {
                     if let (Some(store), Some(collector)) =
                         (state.telemetry_store.as_ref(), collector)
@@ -500,6 +601,8 @@ fn telemetry_stream(
                         )
                         .await;
                     }
+                    persist_request_finish(&state, &context.request_id, Some(status_code), None)
+                        .await;
                     None
                 }
             }
@@ -635,7 +738,7 @@ async fn persist_request_tool_events(
 }
 
 async fn persist_content_capture_from_bytes(
-    state: &AppState,
+    state: &Arc<AppState>,
     request_id: &str,
     direction: &str,
     source: &str,
@@ -684,7 +787,7 @@ async fn persist_content_capture_from_bytes(
 }
 
 async fn persist_content_capture_from_text(
-    state: &AppState,
+    state: &Arc<AppState>,
     store: &TelemetryStore,
     request_id: &str,
     direction: &str,
@@ -703,9 +806,16 @@ async fn persist_content_capture_from_text(
             );
             return;
         }
-        let mut context = RedactionContext::new(request_id, &state.config.redaction);
+        let context = RedactionContext::new(request_id, &state.config.redaction);
         redacted = true;
-        scan_and_redact(state, request_id, preview, &mut context).text
+        let (result, _) = scan_and_redact_blocking(
+            state.clone(),
+            request_id.to_string(),
+            preview.to_string(),
+            context,
+        )
+        .await;
+        result.text
     } else {
         preview.to_string()
     };
@@ -905,6 +1015,25 @@ mod tests {
     }
 
     #[test]
+    fn response_restore_allows_only_uncompressed_textual_payloads() {
+        assert!(response_restore_allowed(Some("application/json"), None));
+        assert!(response_restore_allowed(Some("text/event-stream"), None));
+        assert!(response_restore_allowed(
+            Some("application/vnd.api+json"),
+            None
+        ));
+        assert!(!response_restore_allowed(
+            Some("application/json"),
+            Some("gzip")
+        ));
+        assert!(!response_restore_allowed(
+            Some("application/octet-stream"),
+            None
+        ));
+        assert!(!response_restore_allowed(None, None));
+    }
+
+    #[test]
     fn build_upstream_url_preserves_absolute_proxy_uri() {
         let uri: Uri = "http://127.0.0.1:5180/index.html?x=1".parse().unwrap();
 
@@ -947,10 +1076,31 @@ fn log_connect_tunnel_error(target: &str, error: &std::io::Error) {
     warn!(target = %target, error = %error, "CONNECT tunnel failed");
 }
 
-async fn tunnel_upgraded_connection(upgraded: Upgraded, authority: &str) -> std::io::Result<()> {
-    let mut server = TcpStream::connect(authority).await?;
+async fn tunnel_upgraded_connection(
+    upgraded: Upgraded,
+    authority: &str,
+    connect_timeout_secs: u64,
+    tunnel_timeout_secs: u64,
+) -> std::io::Result<()> {
+    let connect_timeout = Duration::from_secs(connect_timeout_secs.max(1));
+    let mut server = tokio::time::timeout(connect_timeout, TcpStream::connect(authority))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "CONNECT upstream timed out")
+        })??;
     let mut client = TokioIo::new(upgraded);
-    copy_bidirectional(&mut client, &mut server).await?;
+    if tunnel_timeout_secs > 0 {
+        tokio::time::timeout(
+            Duration::from_secs(tunnel_timeout_secs),
+            copy_bidirectional(&mut client, &mut server),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "CONNECT tunnel timed out")
+        })??;
+    } else {
+        copy_bidirectional(&mut client, &mut server).await?;
+    }
     Ok(())
 }
 
@@ -959,15 +1109,30 @@ async fn tunnel_mitm_connection(
     upgraded: Upgraded,
     authority: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(mitm_authority) = state.mitm_authority.as_ref() else {
+    let Some(mitm_authority) = state.mitm_authority.clone() else {
         return Err(Box::new(std::io::Error::other(
             "MITM authority is not configured",
         )));
     };
 
-    let acceptor = mitm_authority.acceptor_for_authority(&authority)?;
+    let acceptor_authority = authority.clone();
+    let acceptor = tokio::task::spawn_blocking(move || {
+        mitm_authority.acceptor_for_authority(&acceptor_authority)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("MITM certificate task failed: {error}")))??;
     let upgraded = TokioIo::new(upgraded);
-    let tls_stream = acceptor.accept(upgraded).await?;
+    let tls_stream = tokio::time::timeout(
+        Duration::from_secs(state.config.proxy.connect_timeout_secs.max(1)),
+        acceptor.accept(upgraded),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "CONNECT MITM TLS handshake timed out",
+        )
+    })??;
     debug!(target = %authority, "CONNECT MITM TLS handshake completed");
 
     let service_authority = authority.clone();
@@ -978,10 +1143,24 @@ async fn tunnel_mitm_connection(
         async move { Ok::<_, Infallible>(handle_mitm_http_request(state, authority, req).await) }
     });
 
-    http1::Builder::new()
+    let serve = http1::Builder::new()
         .serve_connection(TokioIo::new(tls_stream), service)
-        .with_upgrades()
-        .await?;
+        .with_upgrades();
+    if state.config.proxy.request_timeout_secs > 0 {
+        tokio::time::timeout(
+            Duration::from_secs(state.config.proxy.request_timeout_secs),
+            serve,
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "CONNECT MITM session timed out",
+            )
+        })??;
+    } else {
+        serve.await?;
+    }
     debug!(target = %authority, "CONNECT MITM session completed");
 
     Ok(())
@@ -1158,6 +1337,16 @@ async fn handle_mitm_websocket_upgrade(
             .headers_mut()
             .insert(HeaderName::from_static(SEC_WEBSOCKET_PROTOCOL), protocol);
     }
+    if let Some(extensions) = upstream_response
+        .headers()
+        .get(SEC_WEBSOCKET_EXTENSIONS)
+        .cloned()
+    {
+        response.headers_mut().insert(
+            HeaderName::from_static(SEC_WEBSOCKET_EXTENSIONS),
+            extensions,
+        );
+    }
     response
 }
 
@@ -1181,7 +1370,8 @@ async fn proxy_mitm_websocket(
         mode = "mitm",
         request_id = %request_id,
         websocket_mode = %websocket_mode,
-        server_to_client_restoration = false,
+        client_to_server_redaction = websocket_mode == "inspect" && state.config.scanner.enabled,
+        server_to_client_redaction = websocket_mode == "inspect" && state.config.scanner.enabled,
         "WebSocket restoration policy"
     );
     let telemetry_context = RequestTelemetryContext {
@@ -1194,18 +1384,14 @@ async fn proxy_mitm_websocket(
         model: None,
     };
     persist_request_start(&state, &telemetry_context).await;
-    persist_request_finish(
-        &state,
-        &request_id,
-        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
-        None,
-    )
-    .await;
 
     let client_io = TokioIo::new(upgraded);
     let mut client_ws =
         WebSocketStream::from_raw_socket(client_io, Role::Server, Some(WebSocketConfig::default()))
             .await;
+    let mut client_redaction_context = RedactionContext::new(&request_id, &state.config.redaction);
+    let mut upstream_redaction_context =
+        RedactionContext::new(&request_id, &state.config.redaction);
 
     loop {
         tokio::select! {
@@ -1214,10 +1400,17 @@ async fn proxy_mitm_websocket(
                     debug!(mode = "mitm", "Client WebSocket closed");
                     break;
                 };
-                let message = client_msg?;
+                let message = match client_msg {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(mode = "mitm", error = %error, "Client WebSocket read failed");
+                        let _ = upstream_ws.close(None).await;
+                        break;
+                    }
+                };
                 let is_close = matches!(message, Message::Close(_));
                 let message = if websocket_mode == "inspect" && state.config.scanner.enabled {
-                    redact_websocket_message(&state, &request_id, message)
+                    redact_websocket_message(state.clone(), &request_id, message, &mut client_redaction_context).await
                 } else {
                     message
                 };
@@ -1231,7 +1424,11 @@ async fn proxy_mitm_websocket(
                         "client",
                     );
                 }
-                upstream_ws.send(message).await?;
+                if let Err(error) = upstream_ws.send(message).await {
+                    warn!(mode = "mitm", error = %error, "Upstream WebSocket send failed");
+                    let _ = client_ws.close(None).await;
+                    break;
+                }
                 if is_close {
                     let _ = client_ws.close(None).await;
                     break;
@@ -1242,8 +1439,20 @@ async fn proxy_mitm_websocket(
                     debug!(mode = "mitm", "Upstream WebSocket closed");
                     break;
                 };
-                let message = upstream_msg?;
+                let message = match upstream_msg {
+                    Ok(message) => message,
+                    Err(error) => {
+                        warn!(mode = "mitm", error = %error, "Upstream WebSocket read failed");
+                        let _ = client_ws.close(None).await;
+                        break;
+                    }
+                };
                 let is_close = matches!(message, Message::Close(_));
+                let message = if websocket_mode == "inspect" && state.config.scanner.enabled {
+                    redact_websocket_message(state.clone(), &request_id, message, &mut upstream_redaction_context).await
+                } else {
+                    message
+                };
                 if let Message::Text(text) = &message {
                     spawn_websocket_text_telemetry(
                         state.clone(),
@@ -1254,7 +1463,11 @@ async fn proxy_mitm_websocket(
                         "upstream",
                     );
                 }
-                client_ws.send(message).await?;
+                if let Err(error) = client_ws.send(message).await {
+                    warn!(mode = "mitm", error = %error, "Client WebSocket send failed");
+                    let _ = upstream_ws.close(None).await;
+                    break;
+                }
                 if is_close {
                     let _ = upstream_ws.close(None).await;
                     break;
@@ -1265,6 +1478,13 @@ async fn proxy_mitm_websocket(
 
     let _ = client_ws.close(None).await;
     let _ = upstream_ws.close(None).await;
+    persist_request_finish(
+        &state,
+        &request_id,
+        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+        None,
+    )
+    .await;
 
     Ok(())
 }
@@ -1279,7 +1499,7 @@ fn spawn_websocket_text_telemetry(
 ) {
     tokio::spawn(async move {
         persist_websocket_text_telemetry(
-            &state,
+            state,
             &request_id,
             model.as_deref(),
             &upstream_url,
@@ -1291,7 +1511,7 @@ fn spawn_websocket_text_telemetry(
 }
 
 async fn persist_websocket_text_telemetry(
-    state: &AppState,
+    state: Arc<AppState>,
     request_id: &str,
     model: Option<&str>,
     upstream_url: &str,
@@ -1334,7 +1554,7 @@ async fn persist_websocket_text_telemetry(
         )
     {
         persist_content_capture_from_text(
-            state,
+            &state,
             store,
             request_id,
             capture_direction,
@@ -1367,12 +1587,23 @@ fn build_websocket_upstream_request(
     Ok(upstream_request)
 }
 
-fn redact_websocket_message(state: &AppState, request_id: &str, message: Message) -> Message {
+async fn redact_websocket_message(
+    state: Arc<AppState>,
+    request_id: &str,
+    message: Message,
+    context: &mut RedactionContext,
+) -> Message {
     match message {
         Message::Text(text) => {
             let original_len = text.len();
-            let mut context = RedactionContext::new(request_id, &state.config.redaction);
-            let redacted = scan_and_redact(state, request_id, text.as_str(), &mut context);
+            let (redacted, updated_context) = scan_and_redact_blocking(
+                state,
+                request_id.to_string(),
+                text.to_string(),
+                context.clone(),
+            )
+            .await;
+            *context = updated_context;
             if redacted.text.len() != original_len || redacted.text.as_str() != text.as_str() {
                 info!(
                     mode = "mitm",
@@ -1486,7 +1717,6 @@ fn is_websocket_hop_header(name: &str) -> bool {
             | SEC_WEBSOCKET_ACCEPT
             | SEC_WEBSOCKET_KEY
             | SEC_WEBSOCKET_VERSION
-            | SEC_WEBSOCKET_EXTENSIONS
     )
 }
 
@@ -1524,8 +1754,8 @@ struct ProcessedBody {
     context: RedactionContext,
 }
 
-fn process_request_body(
-    state: &AppState,
+async fn process_request_body(
+    state: &Arc<AppState>,
     request_id: &str,
     headers: &HeaderMap,
     body: &Bytes,
@@ -1547,7 +1777,7 @@ fn process_request_body(
         normalized
     };
     let telemetry_bytes = normalized.bytes.clone();
-    let mut context = RedactionContext::new(request_id, &state.config.redaction);
+    let context = RedactionContext::new(request_id, &state.config.redaction);
 
     if !state.config.scanner.enabled {
         return Ok(ProcessedBody {
@@ -1579,7 +1809,13 @@ fn process_request_body(
         });
     };
 
-    let redacted_body = scan_and_redact(state, request_id, body_string, &mut context);
+    let (redacted_body, context) = scan_and_redact_blocking(
+        state.clone(),
+        request_id.to_string(),
+        body_string.to_string(),
+        context,
+    )
+    .await;
     Ok(ProcessedBody {
         bytes: Bytes::from(redacted_body.text.into_bytes()),
         telemetry_bytes,
@@ -1597,12 +1833,19 @@ fn normalize_codex_subscription_payload(body: NormalizedBody) -> NormalizedBody 
         return body;
     };
 
-    if object.get("store") == Some(&Value::Bool(false))
-        && object.get("stream") == Some(&Value::Bool(true))
-    {
+    let store_was = object.get("store").cloned();
+    let stream_was = object.get("stream").cloned();
+    if store_was == Some(Value::Bool(false)) && stream_was == Some(Value::Bool(true)) {
         return body;
     }
 
+    if store_was.is_some() || stream_was.is_some() {
+        warn!(
+            previous_store = ?store_was,
+            previous_stream = ?stream_was,
+            "Overriding Codex subscription request payload store/stream fields"
+        );
+    }
     object.insert("store".to_string(), Value::Bool(false));
     object.insert("stream".to_string(), Value::Bool(true));
     match serde_json::to_vec(&json) {
@@ -1642,8 +1885,8 @@ fn normalize_body(
     };
 
     let decoded = match encoding.as_str() {
-        "gzip" => decompress_gzip(body, max_body_size),
-        "zstd" => decompress_zstd(body, max_body_size),
+        "gzip" => Some(decompress_gzip(body, max_body_size)?),
+        "zstd" => Some(decompress_zstd(body, max_body_size)?),
         _ => None,
     };
 
@@ -1657,16 +1900,12 @@ fn normalize_body(
             decoded: false,
         });
 
-    if normalized.decoded && normalized.bytes.len() > max_body_size {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
     Ok(normalized)
 }
 
-fn decompress_gzip(body: &[u8], max_body_size: usize) -> Option<Bytes> {
+fn decompress_gzip(body: &[u8], max_body_size: usize) -> Result<Bytes, StatusCode> {
     if body.len() < 2 || body[0] != 0x1f || body[1] != 0x8b {
-        return None;
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let decoder = GzDecoder::new(body);
@@ -1674,23 +1913,38 @@ fn decompress_gzip(body: &[u8], max_body_size: usize) -> Option<Bytes> {
     decoder
         .take(max_body_size.saturating_add(1) as u64)
         .read_to_end(&mut decompressed)
-        .ok()?;
-    Some(Bytes::from(decompressed))
+        .map_err(|error| {
+            warn!(error = %error, "Failed to decompress gzip request body");
+            StatusCode::BAD_REQUEST
+        })?;
+    if decompressed.len() > max_body_size {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(Bytes::from(decompressed))
 }
 
-fn decompress_zstd(body: &[u8], max_body_size: usize) -> Option<Bytes> {
+fn decompress_zstd(body: &[u8], max_body_size: usize) -> Result<Bytes, StatusCode> {
     const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
     if body.len() < ZSTD_MAGIC.len() || &body[..ZSTD_MAGIC.len()] != ZSTD_MAGIC {
-        return None;
+        return Err(StatusCode::BAD_REQUEST);
     }
 
-    let decoder = zstd::stream::read::Decoder::new(body).ok()?;
+    let decoder = zstd::stream::read::Decoder::new(body).map_err(|error| {
+        warn!(error = %error, "Failed to initialize zstd request body decoder");
+        StatusCode::BAD_REQUEST
+    })?;
     let mut decompressed = Vec::new();
     decoder
         .take(max_body_size.saturating_add(1) as u64)
         .read_to_end(&mut decompressed)
-        .ok()?;
-    Some(Bytes::from(decompressed))
+        .map_err(|error| {
+            warn!(error = %error, "Failed to decompress zstd request body");
+            StatusCode::BAD_REQUEST
+        })?;
+    if decompressed.len() > max_body_size {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(Bytes::from(decompressed))
 }
 
 /// Scan text for secrets and redact them.
@@ -1732,9 +1986,23 @@ fn scan_and_redact(
     result
 }
 
+async fn scan_and_redact_blocking(
+    state: Arc<AppState>,
+    request_id: String,
+    text: String,
+    mut context: RedactionContext,
+) -> (crate::redactor::RedactionResult, RedactionContext) {
+    tokio::task::spawn_blocking(move || {
+        let result = scan_and_redact(&state, &request_id, &text, &mut context);
+        (result, context)
+    })
+    .await
+    .expect("scan/redact blocking task failed")
+}
+
 /// Scan and redact non-whitelisted header values when scan_scope is "full".
-fn scan_and_redact_headers(
-    state: &AppState,
+async fn scan_and_redact_headers(
+    state: &Arc<AppState>,
     headers: &HeaderMap,
     request_id: &str,
     context: &mut RedactionContext,
@@ -1758,11 +2026,28 @@ fn scan_and_redact_headers(
             continue;
         }
         if let Ok(val_str) = value.to_str() {
-            let redacted = scan_and_redact(state, request_id, val_str, context);
-            if redacted.text != val_str
-                && let Ok(new_val) = HeaderValue::from_str(&redacted.text)
-            {
-                result.append(name.clone(), new_val);
+            let (redacted, updated_context) = scan_and_redact_blocking(
+                state.clone(),
+                request_id.to_string(),
+                val_str.to_string(),
+                context.clone(),
+            )
+            .await;
+            *context = updated_context;
+            if redacted.text != val_str {
+                match HeaderValue::from_str(&redacted.text) {
+                    Ok(new_val) => {
+                        result.append(name.clone(), new_val);
+                    }
+                    Err(error) => {
+                        warn!(
+                            request_id,
+                            header = %name,
+                            error = %error,
+                            "Dropping header because redacted value is invalid"
+                        );
+                    }
+                }
                 continue;
             }
         }
@@ -1772,8 +2057,8 @@ fn scan_and_redact_headers(
 }
 
 /// Scan and redact query parameter values when scan_scope is "full".
-fn scan_and_redact_query_params(
-    state: &AppState,
+async fn scan_and_redact_query_params(
+    state: &Arc<AppState>,
     url: &str,
     request_id: &str,
     context: &mut RedactionContext,
@@ -1782,21 +2067,42 @@ fn scan_and_redact_query_params(
         return url.to_string();
     };
 
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    let mut segments = Vec::new();
     let mut changed = false;
-    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        let redacted_value = scan_and_redact(state, request_id, &value, context);
+    for raw_segment in query.split('&') {
+        let (raw_key, raw_value) = raw_segment.split_once('=').unwrap_or((raw_segment, ""));
+        let key = percent_decode_query_component(raw_key);
+        let value = percent_decode_query_component(raw_value);
+        let (redacted_value, updated_context) = scan_and_redact_blocking(
+            state.clone(),
+            request_id.to_string(),
+            value.to_string(),
+            context.clone(),
+        )
+        .await;
+        *context = updated_context;
         if redacted_value.text != value {
             changed = true;
+            let mut serializer = form_urlencoded::Serializer::new(String::new());
+            serializer.append_pair(&key, &redacted_value.text);
+            segments.push(serializer.finish());
+        } else {
+            segments.push(raw_segment.to_string());
         }
-        serializer.append_pair(&key, &redacted_value.text);
     }
 
     if changed {
-        format!("{}?{}", base, serializer.finish())
+        format!("{}?{}", base, segments.join("&"))
     } else {
         url.to_string()
     }
+}
+
+fn percent_decode_query_component(value: &str) -> String {
+    form_urlencoded::parse(value.as_bytes())
+        .next()
+        .map(|(value, _)| value.into_owned())
+        .unwrap_or_default()
 }
 
 /// Build the full upstream URL from base URL and request URI.
@@ -1812,8 +2118,8 @@ fn build_upstream_url(base: &str, uri: &Uri) -> String {
 }
 
 /// Convert axum Method to reqwest Method.
-fn reqwest_method(method: &Method) -> reqwest::Method {
-    reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
+fn reqwest_method(method: &Method) -> Result<reqwest::Method, ()> {
+    reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(|_| ())
 }
 
 /// Forward request headers, skipping hop-by-hop headers.

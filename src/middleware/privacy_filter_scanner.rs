@@ -1,5 +1,6 @@
 use std::process::Stdio;
 use std::time::Duration;
+use std::{sync::OnceLock, sync::mpsc};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -240,15 +241,13 @@ impl SecretScanner for PrivacyFilterScanner {
         let scanner = self.clone();
         let text = text.to_string();
         let fallback_text = text.clone();
-        let result = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("runtime_failed:{error}"))?;
-            runtime.block_on(scanner.scan_async(&text))
-        })
-        .join()
-        .unwrap_or_else(|_| Err("thread_panic".to_string()));
+        let (sender, receiver) = mpsc::channel();
+        privacy_filter_runtime().spawn(async move {
+            let _ = sender.send(scanner.scan_async(&text).await);
+        });
+        let result = receiver
+            .recv()
+            .unwrap_or_else(|_| Err("runtime_channel_closed".to_string()));
 
         match result {
             Ok(findings) => {
@@ -283,6 +282,18 @@ impl SecretScanner for PrivacyFilterScanner {
     fn name(&self) -> &str {
         "privacy_filter"
     }
+}
+
+fn privacy_filter_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("privacy-filter-scanner")
+            .enable_all()
+            .build()
+            .expect("failed to build privacy filter scanner runtime")
+    })
 }
 
 fn category_for_privacy_filter_label(label: &str) -> String {

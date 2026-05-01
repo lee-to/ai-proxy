@@ -114,24 +114,17 @@ impl MitmAuthority {
     }
 
     fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, BoxError> {
-        {
-            let mut cache = self
-                .cert_cache
-                .lock()
-                .map_err(|_| config_error("MITM certificate cache lock poisoned"))?;
-            if let Some(config) = cache.get(host) {
-                debug!(host = %host, "MITM certificate cache hit");
-                return Ok(config);
-            }
-        }
-
-        debug!(host = %host, "MITM certificate cache miss");
-        let config = Arc::new(self.generate_server_config(host)?);
-
         let mut cache = self
             .cert_cache
             .lock()
             .map_err(|_| config_error("MITM certificate cache lock poisoned"))?;
+        if let Some(config) = cache.get(host) {
+            debug!(host = %host, "MITM certificate cache hit");
+            return Ok(config);
+        }
+
+        debug!(host = %host, "MITM certificate cache miss");
+        let config = Arc::new(self.generate_server_config(host)?);
         cache.insert(host.to_string(), config.clone(), self.cache_size);
 
         Ok(config)
@@ -216,13 +209,14 @@ fn ensure_ca_files(cert_path: &Path, key_path: &Path) -> Result<(), BoxError> {
 }
 
 fn write_private_key(key_path: &Path, key_pem: &str) -> Result<(), BoxError> {
-    fs::write(key_path, key_pem)?;
-
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    std::io::Write::write_all(&mut options.open(key_path)?, key_pem.as_bytes())?;
 
     Ok(())
 }

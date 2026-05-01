@@ -22,6 +22,7 @@ flate2 = "1"
 futures-util = "0.3"
 tower = { version = "0.5", features = ["limit"] }
 governor = "0.8"
+getrandom = "0.3"
 url = "2"
 zstd = "0.13"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }

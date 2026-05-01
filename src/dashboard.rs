@@ -1,33 +1,40 @@
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
 use tracing::{debug, error, info, warn};
 
 use crate::config::DashboardConfig;
-use crate::telemetry::DEFAULT_QUERY_WINDOW_HOURS;
+use crate::telemetry::{DEFAULT_QUERY_WINDOW_HOURS, new_ulid};
 use crate::telemetry_store::TelemetryStore;
 
 #[derive(Clone)]
 pub struct DashboardState {
     store: Arc<TelemetryStore>,
+    token: Arc<String>,
 }
 
-pub fn dashboard_router(store: Arc<TelemetryStore>) -> Router {
+pub fn dashboard_router(store: Arc<TelemetryStore>, token: String) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/usage/day", get(usage_day))
         .route("/api/tools/day", get(tools_day))
         .route("/api/errors/day", get(errors_day))
         .route("/api/timeline/day", get(timeline_day))
-        .with_state(DashboardState { store })
+        .with_state(DashboardState {
+            store,
+            token: Arc::new(token),
+        })
 }
 
 pub async fn serve_dashboard(
@@ -42,29 +49,33 @@ pub async fn serve_dashboard(
         );
         return Err("dashboard listen address must be loopback-only".into());
     }
+    let token_path = expand_home_path(&config.token_path);
+    let token = ensure_dashboard_token(&token_path)?;
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    info!(listen_addr = %listen_addr, "Dashboard server started");
-    axum::serve(listener, dashboard_router(store)).await?;
+    info!(
+        listen_addr = %listen_addr,
+        token_path = %token_path.display(),
+        "Dashboard server started"
+    );
+    axum::serve(listener, dashboard_router(store, token)).await?;
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
+async fn index(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
     debug!("Serving dashboard HTML");
-    Html(DASHBOARD_HTML)
+    if !is_authorized(&state.token, &headers, &uri) {
+        return unauthorized_response();
+    }
+    ([("referrer-policy", "no-referrer")], Html(DASHBOARD_HTML)).into_response()
 }
 
-async fn usage_day(State(state): State<DashboardState>) -> Response {
+async fn usage_day(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
+    if !is_authorized(&state.token, &headers, &uri) {
+        return unauthorized_response();
+    }
     let started = Instant::now();
     debug!("Handling dashboard usage endpoint");
-    if let Err(error) = state.store.purge_expired().await {
-        error!(endpoint = "/api/usage/day", error = %error, "Failed to purge telemetry before usage query");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to purge telemetry",
-        )
-            .into_response();
-    }
 
     match state
         .store
@@ -88,17 +99,12 @@ async fn usage_day(State(state): State<DashboardState>) -> Response {
     }
 }
 
-async fn tools_day(State(state): State<DashboardState>) -> Response {
+async fn tools_day(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
+    if !is_authorized(&state.token, &headers, &uri) {
+        return unauthorized_response();
+    }
     let started = Instant::now();
     debug!("Handling dashboard tools endpoint");
-    if let Err(error) = state.store.purge_expired().await {
-        error!(endpoint = "/api/tools/day", error = %error, "Failed to purge telemetry before tools query");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to purge telemetry",
-        )
-            .into_response();
-    }
 
     match state
         .store
@@ -121,17 +127,12 @@ async fn tools_day(State(state): State<DashboardState>) -> Response {
     }
 }
 
-async fn errors_day(State(state): State<DashboardState>) -> Response {
+async fn errors_day(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
+    if !is_authorized(&state.token, &headers, &uri) {
+        return unauthorized_response();
+    }
     let started = Instant::now();
     debug!("Handling dashboard errors endpoint");
-    if let Err(error) = state.store.purge_expired().await {
-        error!(endpoint = "/api/errors/day", error = %error, "Failed to purge telemetry before errors query");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to purge telemetry",
-        )
-            .into_response();
-    }
 
     match state
         .store
@@ -154,17 +155,16 @@ async fn errors_day(State(state): State<DashboardState>) -> Response {
     }
 }
 
-async fn timeline_day(State(state): State<DashboardState>) -> Response {
+async fn timeline_day(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !is_authorized(&state.token, &headers, &uri) {
+        return unauthorized_response();
+    }
     let started = Instant::now();
     debug!("Handling dashboard timeline endpoint");
-    if let Err(error) = state.store.purge_expired().await {
-        error!(endpoint = "/api/timeline/day", error = %error, "Failed to purge telemetry before timeline query");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to purge telemetry",
-        )
-            .into_response();
-    }
 
     match state
         .store
@@ -185,6 +185,90 @@ async fn timeline_day(State(state): State<DashboardState>) -> Response {
             (StatusCode::INTERNAL_SERVER_ERROR, "timeline query failed").into_response()
         }
     }
+}
+
+fn expand_home_path(path: &Path) -> std::path::PathBuf {
+    let Some(path_text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let Some(rest) = path_text.strip_prefix("~/") else {
+        return path.to_path_buf();
+    };
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(rest)
+}
+
+fn ensure_dashboard_token(path: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match fs::read_to_string(path) {
+        Ok(token) => {
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dashboard token file is empty",
+                )
+                .into());
+            }
+            return Ok(token);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let token = format!("{}.{}", new_ulid()?, new_ulid()?);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(format!("{token}\n").as_bytes())?;
+    Ok(token)
+}
+
+fn is_authorized(token: &str, headers: &HeaderMap, uri: &Uri) -> bool {
+    if headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|candidate| constant_time_eq(candidate, token))
+    {
+        return true;
+    }
+
+    uri.query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .any(|(name, value)| name == "token" && constant_time_eq(&value, token))
+        })
+        .unwrap_or(false)
+}
+
+fn constant_time_eq(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    let mut diff = candidate.len() ^ expected.len();
+    for index in 0..expected.len() {
+        let candidate_byte = candidate.get(index).copied().unwrap_or(0);
+        diff |= usize::from(candidate_byte ^ expected[index]);
+    }
+    diff == 0
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [("www-authenticate", "Bearer")],
+        "dashboard token required",
+    )
+        .into_response()
 }
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
@@ -499,12 +583,23 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       return '<tr>' + cells.map((cell) => '<td' + (cell.right ? ' class="right"' : '') + '>' + cell.value + '</td>').join('') + '</tr>';
     }
 
+    const queryToken = new URLSearchParams(window.location.search).get('token');
+    if (queryToken) {
+      sessionStorage.setItem('dashboardToken', queryToken);
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+    const dashboardToken = sessionStorage.getItem('dashboardToken');
+    function apiFetch(path) {
+      const options = dashboardToken ? { headers: { Authorization: 'Bearer ' + dashboardToken } } : {};
+      return fetch(path, options);
+    }
+
     async function refresh() {
       const [usage, tools, errors, timeline] = await Promise.all([
-        fetch('/api/usage/day').then((response) => response.json()),
-        fetch('/api/tools/day').then((response) => response.json()),
-        fetch('/api/errors/day').then((response) => response.json()),
-        fetch('/api/timeline/day').then((response) => response.json())
+        apiFetch('/api/usage/day').then((response) => response.json()),
+        apiFetch('/api/tools/day').then((response) => response.json()),
+        apiFetch('/api/errors/day').then((response) => response.json()),
+        apiFetch('/api/timeline/day').then((response) => response.json())
       ]);
 
       document.getElementById('totalTokens').textContent = fmt.format(usage.totals.total_tokens);
@@ -587,14 +682,14 @@ mod tests {
         let store = Arc::new(TelemetryStore::open_in_memory(24).await.unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = dashboard_router(store);
+        let app = dashboard_router(store, "test-token".to_string());
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let response = client
-            .get(format!("http://{addr}/api/usage/day"))
+            .get(format!("http://{addr}/api/usage/day?token=test-token"))
             .send()
             .await
             .unwrap();
@@ -606,6 +701,27 @@ mod tests {
         assert_eq!(body.totals.request_count, 0);
         assert_eq!(body.totals.error_count, 0);
         assert_eq!(body.totals.auxiliary_error_count, 0);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_rejects_missing_dashboard_token() {
+        let store = Arc::new(TelemetryStore::open_in_memory(24).await.unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = dashboard_router(store, "test-token".to_string());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!("http://{addr}/api/usage/day"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         handle.abort();
     }

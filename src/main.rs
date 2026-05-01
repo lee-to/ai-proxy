@@ -138,6 +138,17 @@ async fn main() {
         None
     };
     let dashboard_store = telemetry_store.clone();
+    if let Some(store) = telemetry_store.clone() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
+            loop {
+                interval.tick().await;
+                if let Err(error) = store.purge_expired().await {
+                    tracing::error!(error = %error, "Telemetry retention purge failed");
+                }
+            }
+        });
+    }
 
     // Create shared state
     let state = Arc::new(AppState {

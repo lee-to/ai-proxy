@@ -19,6 +19,7 @@ websocket_mode = "inspect"                       # reject | passthrough | inspec
 [dashboard]
 enabled = false
 listen_addr = "127.0.0.1:18081"                  # loopback only; use ssh -L for remote access
+token_path = "~/.ai-proxy/dashboard.token"       # generated on first start; use an absolute path like /etc/ai-proxy/dashboard.token for systemd/prod
 sqlite_path = "ai-proxy-telemetry.sqlite"
 retention_hours = 24
 
@@ -34,7 +35,7 @@ prefix_len = 3
 suffix_len = 3
 mask = "***...***"
 response_restore_enabled = false
-restorable_categories = ["email", "person_name", "phone"]
+restorable_categories = ["email", "phone"]       # add person_name only if response restore is safe for your deployment
 
 [scanner]
 enabled = false

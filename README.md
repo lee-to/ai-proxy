@@ -229,12 +229,12 @@ prefix_len = 3          # visible prefix characters
 suffix_len = 3          # visible suffix characters
 mask = "***...***"      # mask placeholder
 response_restore_enabled = false
-restorable_categories = ["email", "person_name", "phone"]
+restorable_categories = ["email", "phone"]
 ```
 
 A secret like `sk-ant-abcdef123456789xyz` becomes `sk-***...***xyz`. Secrets shorter than `prefix_len + suffix_len + 2` characters are fully masked.
 
-Set `strategy = "placeholder"` to send typed placeholders upstream instead of masked values. PII categories listed in `restorable_categories` can be restored in downstream HTTP responses when `response_restore_enabled = true`; secret categories such as API keys, passwords, private keys, JWTs, and connection strings are not restored by default. Request-local placeholder maps are kept only for the active request/response and are not logged.
+Set `strategy = "placeholder"` to send typed placeholders upstream instead of masked values. PII categories listed in `restorable_categories` can be restored in downstream HTTP responses when `response_restore_enabled = true`; `person_name` is not restorable by default and should only be added when restoring names to the client is safe for your deployment. Secret categories such as API keys, passwords, private keys, JWTs, and connection strings are not restored by default. Request-local placeholder maps are kept only for the active request/response and are not logged.
 
 SSE and chunked responses use a bounded rolling buffer so placeholders split across chunks, for example `[EMAIL_1]`, can still be restored without buffering the full stream. WebSocket MITM inspection currently redacts client-to-upstream text frames only; server-to-client WebSocket restoration is intentionally not enabled in this implementation.
 
@@ -416,6 +416,7 @@ The adapter response must use UTF-8 byte offsets in the exact request text:
 [dashboard]
 enabled = false
 listen_addr = "127.0.0.1:18081"   # loopback only; use SSH tunneling for remote access
+token_path = "~/.ai-proxy/dashboard.token"
 sqlite_path = "ai-proxy-telemetry.sqlite"
 retention_hours = 24
 
@@ -426,18 +427,32 @@ max_body_bytes = 8192
 redact_before_store = true
 ```
 
-The dashboard listener is intentionally separate from the proxy listener and must bind to a loopback address.
+The dashboard listener is intentionally separate from the proxy listener and must bind to a loopback address. A random token is generated at `token_path` on first start; pass it as `Authorization: Bearer <token>` or open the dashboard with `?token=<token>`. Query-string tokens are accepted for browser convenience; the dashboard sends `Referrer-Policy: no-referrer`, removes the token from the address bar after load, and uses an `Authorization` header for API refreshes.
 
 Enable it on the server and reach it through an SSH tunnel:
 
 ```bash
 ssh -L 18081:127.0.0.1:18081 user@server
-open http://127.0.0.1:18081
+TOKEN=$(ssh user@server 'cat ~/.ai-proxy/dashboard.token')
+open "http://127.0.0.1:18081/?token=$TOKEN"
+```
+
+If the service runs under systemd with `WorkingDirectory=/etc/ai-proxy` and `token_path` is not set, the default token file may be created relative to that service environment, for example `/etc/ai-proxy/.ai-proxy/dashboard.token`. Production installs should set an absolute path to make the token location predictable:
+
+```toml
+[dashboard]
+token_path = "/etc/ai-proxy/dashboard.token"
+```
+
+Then retrieve it with:
+
+```bash
+ssh user@server 'sudo cat /etc/ai-proxy/dashboard.token'
 ```
 
 The dashboard stores the rolling last 24 hours of proxy telemetry in SQLite by default. It records request metadata, token usage reported by upstream responses, and tool-call/tool-result markers visible in proxied JSON or SSE payloads. It does not record local shell or filesystem actions that never pass through the model API, and server logs must not include raw prompts, auth headers, cookies, tool arguments, or tool output bodies.
 
-Prompt and response previews are opt-in through `[dashboard.capture]`. With `redact_before_store = true`, the proxy scans/redacts a copy of the preview before writing it to SQLite. This does not require `[scanner].enabled = true`; that flag controls live traffic redaction and can break strict transports such as Codex WebSockets. Keep `[scanner].enabled = false` when you only want dashboard capture, but keep the scanner sub-sections such as `[scanner.regex]`, `[scanner.entropy]`, and `[scanner.structural]` configured so capture redaction has detectors to use. Set `prompts` or `responses` only on trusted machines and keep `max_body_bytes` small. HTML response bodies are omitted from previews and replaced with a short summary so Cloudflare/error pages do not fill the dashboard or SQLite database.
+Prompt and response previews are opt-in through `[dashboard.capture]`. With `redact_before_store = true`, the proxy scans/redacts a copy of the preview before writing it to SQLite and fails configuration if no scanners are configured. This does not require `[scanner].enabled = true`; that flag controls live traffic redaction and can break strict transports such as Codex WebSockets. Keep `[scanner].enabled = false` when you only want dashboard capture, but keep the scanner sub-sections such as `[scanner.regex]`, `[scanner.entropy]`, and `[scanner.structural]` configured so capture redaction has detectors to use. Set `prompts` or `responses` only on trusted machines and keep `max_body_bytes` small. HTML response bodies are omitted from previews and replaced with a short summary so Cloudflare/error pages do not fill the dashboard or SQLite database.
 
 ### Environment Overrides
 
@@ -451,7 +466,7 @@ AI_PROXY_STRUCTURAL_SCANNER_ENABLED=false
 AI_PROXY_SCAN_SCOPE=full
 AI_PROXY_REDACTION_STRATEGY=partial
 AI_PROXY_RESPONSE_RESTORE_ENABLED=false
-AI_PROXY_RESTORABLE_CATEGORIES=email,person_name,phone
+AI_PROXY_RESTORABLE_CATEGORIES=email,phone
 AI_PROXY_REDACTION_PREFIX_LEN=3
 AI_PROXY_REDACTION_SUFFIX_LEN=3
 AI_PROXY_REDACTION_MASK='***...***'
@@ -480,6 +495,7 @@ AI_PROXY_CONNECT_TIMEOUT_SECS=10
 AI_PROXY_REQUEST_TIMEOUT_SECS=0       # 0 disables total request timeout
 AI_PROXY_LISTEN_ADDR=127.0.0.1:8080
 AI_PROXY_ANTHROPIC_UPSTREAM_URL=https://api.anthropic.com
+AI_PROXY_UPSTREAM_URL=https://api.anthropic.com  # legacy alias for AI_PROXY_ANTHROPIC_UPSTREAM_URL
 AI_PROXY_CODEX_UPSTREAM_URL=https://api.openai.com
 AI_PROXY_CODEX_SUBSCRIPTION_URL=https://chatgpt.com/backend-api/codex/responses
 AI_PROXY_CODEX_SUBSCRIPTION_ROUTING_ENABLED=false
@@ -491,6 +507,7 @@ AI_PROXY_MITM_EXCLUDED_HOSTS=example.com,internal.example
 AI_PROXY_WEBSOCKET_MODE=inspect
 AI_PROXY_DASHBOARD_ENABLED=false
 AI_PROXY_DASHBOARD_LISTEN_ADDR=127.0.0.1:18081
+AI_PROXY_DASHBOARD_TOKEN_PATH=~/.ai-proxy/dashboard.token
 AI_PROXY_DASHBOARD_SQLITE_PATH=ai-proxy-telemetry.sqlite
 AI_PROXY_DASHBOARD_RETENTION_HOURS=24
 AI_PROXY_DASHBOARD_CAPTURE_PROMPTS=false

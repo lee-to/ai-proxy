@@ -56,6 +56,8 @@ pub struct DashboardConfig {
     pub enabled: bool,
     #[serde(default = "default_dashboard_listen_addr")]
     pub listen_addr: String,
+    #[serde(default = "default_dashboard_token_path")]
+    pub token_path: PathBuf,
     #[serde(default = "default_dashboard_sqlite_path")]
     pub sqlite_path: PathBuf,
     #[serde(default = "default_dashboard_retention_hours")]
@@ -69,6 +71,7 @@ impl Default for DashboardConfig {
         Self {
             enabled: false,
             listen_addr: default_dashboard_listen_addr(),
+            token_path: default_dashboard_token_path(),
             sqlite_path: default_dashboard_sqlite_path(),
             retention_hours: default_dashboard_retention_hours(),
             capture: DashboardCaptureConfig::default(),
@@ -129,6 +132,13 @@ fn default_websocket_mode() -> String {
 fn default_dashboard_listen_addr() -> String {
     "127.0.0.1:18081".to_string()
 }
+fn default_dashboard_token_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ai-proxy")
+        .join("dashboard.token")
+}
 fn default_dashboard_sqlite_path() -> PathBuf {
     PathBuf::from("ai-proxy-telemetry.sqlite")
 }
@@ -139,11 +149,7 @@ fn default_dashboard_capture_max_body_bytes() -> usize {
     8192
 }
 fn default_restorable_categories() -> Vec<String> {
-    vec![
-        "email".to_string(),
-        "person_name".to_string(),
-        "phone".to_string(),
-    ]
+    vec!["email".to_string(), "phone".to_string()]
 }
 fn default_model_mode() -> String {
     "hybrid".to_string()
@@ -408,6 +414,10 @@ impl Config {
             &mut self.dashboard.listen_addr,
         );
         override_path(
+            "AI_PROXY_DASHBOARD_TOKEN_PATH",
+            &mut self.dashboard.token_path,
+        );
+        override_path(
             "AI_PROXY_DASHBOARD_SQLITE_PATH",
             &mut self.dashboard.sqlite_path,
         );
@@ -659,6 +669,22 @@ impl Config {
             }
         }
 
+        if self.scanner.regex.enabled {
+            for pattern in &self.scanner.regex.patterns {
+                if let Err(error) = regex::Regex::new(&pattern.pattern) {
+                    warn!(
+                        name = %pattern.name,
+                        pattern = %pattern.pattern,
+                        error = %error,
+                        "Regex scanner pattern is invalid"
+                    );
+                    return Err(config_error(
+                        "scanner.regex.patterns contains an invalid regex pattern",
+                    ));
+                }
+            }
+        }
+
         if self.scanner.privacy_filter.enabled {
             let has_endpoint = !self.scanner.privacy_filter.endpoint.trim().is_empty();
             let has_command = !self.scanner.privacy_filter.command.trim().is_empty();
@@ -755,9 +781,27 @@ impl Config {
                     "dashboard.capture.max_body_bytes must be greater than zero when capture is enabled",
                 ));
             }
+
+            if self.dashboard.capture.redact_before_store
+                && (self.dashboard.capture.prompts || self.dashboard.capture.responses)
+                && !self.has_capture_redaction_scanner()
+            {
+                warn!("Dashboard capture redaction requires at least one configured scanner");
+                return Err(config_error(
+                    "dashboard.capture.redact_before_store requires at least one scanner to be configured",
+                ));
+            }
         }
 
         Ok(())
+    }
+
+    fn has_capture_redaction_scanner(&self) -> bool {
+        self.scanner.regex.enabled
+            || self.scanner.entropy.enabled
+            || self.scanner.structural.enabled
+            || self.scanner.model.enabled
+            || self.scanner.privacy_filter.enabled
     }
 }
 
@@ -867,6 +911,7 @@ mod tests {
             dashboard: DashboardConfig {
                 enabled: true,
                 listen_addr: listen_addr.to_string(),
+                token_path: default_dashboard_token_path(),
                 sqlite_path: default_dashboard_sqlite_path(),
                 retention_hours: default_dashboard_retention_hours(),
                 capture: DashboardCaptureConfig::default(),
@@ -918,6 +963,34 @@ mod tests {
     fn dashboard_accepts_loopback_listen_addr_when_enabled() {
         let config = minimal_config_with_dashboard("127.0.0.1:18081");
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn dashboard_capture_redaction_requires_configured_scanner() {
+        let mut config = minimal_config_with_dashboard("127.0.0.1:18081");
+        config.dashboard.capture.prompts = true;
+        config.scanner.regex.enabled = false;
+        config.scanner.entropy.enabled = false;
+        config.scanner.structural.enabled = false;
+        config.scanner.model.enabled = false;
+        config.scanner.privacy_filter.enabled = false;
+
+        let error = config.validate().unwrap_err().to_string();
+
+        assert!(error.contains("redact_before_store requires at least one scanner"));
+    }
+
+    #[test]
+    fn regex_scanner_rejects_invalid_pattern_when_enabled() {
+        let mut config = minimal_config_with_dashboard("127.0.0.1:18081");
+        config.scanner.regex.patterns = vec![RegexPattern {
+            name: "bad".to_string(),
+            pattern: "[invalid".to_string(),
+        }];
+
+        let error = config.validate().unwrap_err().to_string();
+
+        assert!(error.contains("invalid regex pattern"));
     }
 
     #[test]

@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 pub const DEFAULT_QUERY_WINDOW_HOURS: u64 = 24;
 pub const MAX_RESPONSE_TELEMETRY_BUFFER_BYTES: usize = 1024 * 1024;
+static LAST_ULID_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
@@ -168,8 +167,47 @@ pub struct RequestTelemetryContext {
 }
 
 pub fn next_request_id() -> String {
-    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("req-{counter}")
+    format!(
+        "req-{}",
+        new_ulid().expect("secure random source unavailable for request id")
+    )
+}
+
+pub fn new_ulid() -> Result<String, getrandom::Error> {
+    let timestamp_ms = monotonic_timestamp_ms();
+    let mut bytes = [0u8; 16];
+    let timestamp = timestamp_ms.to_be_bytes();
+    bytes[..6].copy_from_slice(&timestamp[2..]);
+    getrandom::fill(&mut bytes[6..])?;
+    Ok(encode_ulid(bytes))
+}
+
+fn monotonic_timestamp_ms() -> u64 {
+    let now = now_ms().max(0) as u64;
+    let mut current = LAST_ULID_TIMESTAMP_MS.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(current);
+        match LAST_ULID_TIMESTAMP_MS.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn encode_ulid(bytes: [u8; 16]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut value = u128::from_be_bytes(bytes);
+    let mut encoded = [b'0'; 26];
+    for index in (0..26).rev() {
+        encoded[index] = ALPHABET[(value & 0b11111) as usize];
+        value >>= 5;
+    }
+    String::from_utf8(encoded.to_vec()).expect("ULID alphabet is ASCII")
 }
 
 pub fn now_ms() -> i64 {

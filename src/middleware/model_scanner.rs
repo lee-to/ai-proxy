@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::{sync::OnceLock, sync::mpsc};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -189,15 +190,13 @@ impl SecretScanner for ModelScanner {
         let scanner = self.clone();
         let text = text.to_string();
         let fallback_text = text.clone();
-        let result = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("runtime_failed:{error}"))?;
-            runtime.block_on(scanner.scan_async(&text))
-        })
-        .join()
-        .unwrap_or_else(|_| Err("thread_panic".to_string()));
+        let (sender, receiver) = mpsc::channel();
+        model_scanner_runtime().spawn(async move {
+            let _ = sender.send(scanner.scan_async(&text).await);
+        });
+        let result = receiver
+            .recv()
+            .unwrap_or_else(|_| Err("runtime_channel_closed".to_string()));
         match result {
             Ok(findings) => {
                 debug!(
@@ -235,6 +234,18 @@ impl SecretScanner for ModelScanner {
     fn name(&self) -> &str {
         "model"
     }
+}
+
+fn model_scanner_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("model-scanner")
+            .enable_all()
+            .build()
+            .expect("failed to build model scanner runtime")
+    })
 }
 
 fn parse_model_findings(body: &[u8]) -> Result<Vec<ModelFinding>, serde_json::Error> {

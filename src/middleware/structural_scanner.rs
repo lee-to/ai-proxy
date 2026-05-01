@@ -27,9 +27,9 @@ impl StructuralScanner {
             detect_jwt: config.detect_jwt,
             detect_connection_strings: config.detect_connection_strings,
             detect_env_patterns: config.detect_env_patterns,
-            // JWT: three base64url segments separated by dots
+            // JWT: signed or unsigned base64url header.payload[.signature]
             jwt_regex: Regex::new(
-                r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+                r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.(?:[A-Za-z0-9_-]{10,})?(?:\b|$)"
             ).expect("jwt regex"),
             // Connection strings: protocol://user:pass@host or key=value pairs with password
             connection_string_regex: Regex::new(
@@ -37,7 +37,7 @@ impl StructuralScanner {
             ).expect("connection string regex"),
             // .env style: KEY=value where KEY looks like a secret variable name
             env_pattern_regex: Regex::new(
-                r"(?im)^(?:export\s+)?(?:DATABASE_URL|DB_PASSWORD|SECRET_KEY|API_KEY|API_SECRET|AWS_SECRET_ACCESS_KEY|PRIVATE_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN)\s*=\s*\S+"
+                r"(?im)^(?:export\s+)?(?:[A-Z0-9_]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE[_-]?KEY|WEBHOOK[_-]?URL|DATABASE[_-]?URL|DB[_-]?URL)[A-Z0-9_]*|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|STRIPE_KEY|GITHUB_TOKEN|SLACK_BOT_TOKEN)\s*=\s*\S+"
             ).expect("env pattern regex"),
         }
     }
@@ -146,6 +146,15 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_unsigned_jwt() {
+        let scanner = StructuralScanner::new(&full_config());
+        let jwt = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.";
+        let matches = scanner.scan(jwt);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].pattern_name, "jwt_token");
+    }
+
+    #[test]
     fn test_detect_postgres_connection_string() {
         let scanner = StructuralScanner::new(&full_config());
         let text = "DATABASE_URL=postgresql://user:password123@localhost:5432/mydb";
@@ -184,6 +193,20 @@ mod tests {
         let text = "export API_KEY=sk-abc123def456";
         let matches = scanner.scan(text);
         assert!(matches.iter().any(|m| m.pattern_name == "env_variable"));
+    }
+
+    #[test]
+    fn test_detect_common_provider_env_keys() {
+        let scanner = StructuralScanner::new(&full_config());
+        let text = "OPENAI_API_KEY=sk-proj-abc123\nSTRIPE_KEY=rk_live_123";
+        let matches = scanner.scan(text);
+        assert_eq!(
+            matches
+                .iter()
+                .filter(|m| m.pattern_name == "env_variable")
+                .count(),
+            2
+        );
     }
 
     #[test]

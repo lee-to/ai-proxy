@@ -54,9 +54,14 @@ impl EntropyScanner {
 
     /// Check if any keyword appears within `proximity` bytes of position `pos` in `text`.
     fn keyword_nearby(&self, text: &str, pos: usize, len: usize) -> bool {
-        let search_start = pos.saturating_sub(self.keyword_proximity);
-        let search_end = (pos + len + self.keyword_proximity).min(text.len());
-        let search_area = &text[search_start..search_end].to_lowercase();
+        let search_start = floor_char_boundary(text, pos.saturating_sub(self.keyword_proximity));
+        let search_end = ceil_char_boundary(
+            text,
+            pos.saturating_add(len)
+                .saturating_add(self.keyword_proximity)
+                .min(text.len()),
+        );
+        let search_area = text[search_start..search_end].to_lowercase();
 
         self.keywords
             .iter()
@@ -101,6 +106,20 @@ impl EntropyScanner {
 
         candidates
     }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 impl SecretScanner for EntropyScanner {
@@ -221,5 +240,15 @@ mod tests {
         let text = "token = abc123";
         let matches = scanner.scan(text);
         assert!(matches.is_empty(), "Short tokens should be ignored");
+    }
+
+    #[test]
+    fn keyword_proximity_handles_multibyte_boundaries() {
+        let scanner = EntropyScanner::new(&test_config());
+        let text = "секрет token = aB3xZ9mK2pL5nR8vQ4wE7jF1hG6";
+
+        let matches = scanner.scan(text);
+
+        assert!(!matches.is_empty());
     }
 }

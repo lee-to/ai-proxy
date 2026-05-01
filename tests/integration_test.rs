@@ -26,6 +26,30 @@ async fn start_mock_upstream() -> (String, tokio::task::JoinHandle<()>) {
     (url, handle)
 }
 
+async fn start_json_echo_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::body::Body;
+    use axum::response::Response;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{}", addr);
+
+    let handle = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/{*path}",
+            any(|body: Bytes| async move {
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (url, handle)
+}
+
 /// Start a mock upstream that returns SSE-style streaming response.
 async fn start_sse_upstream() -> (String, tokio::task::JoinHandle<()>) {
     use axum::body::Body;
@@ -273,6 +297,18 @@ async fn start_websocket_echo_upstream() -> (String, tokio::task::JoinHandle<()>
                 while let Some(message) = websocket.next().await {
                     let Ok(message) = message else {
                         break;
+                    };
+                    let message = match message {
+                        tokio_tungstenite::tungstenite::Message::Text(text) => {
+                            tokio_tungstenite::tungstenite::Message::Text(
+                                format!(
+                                    r#"{} {{"upstream_key":"sk-ant-api03-abcdefghijklmnopqrstuvwxyz"}}"#,
+                                    text
+                                )
+                                .into(),
+                            )
+                        }
+                        other => other,
                     };
                     if websocket.send(message).await.is_err() {
                         break;
@@ -901,7 +937,7 @@ async fn test_proxy_redacts_aws_key_in_body() {
 
 #[tokio::test]
 async fn test_proxy_restores_reversible_email_but_not_secret_placeholder() {
-    let (upstream_url, _upstream_handle) = start_mock_upstream().await;
+    let (upstream_url, _upstream_handle) = start_json_echo_upstream().await;
     let (proxy_url, _proxy_handle) =
         start_proxy_with_placeholder_restore(&upstream_url, "body").await;
 
@@ -1101,7 +1137,7 @@ async fn test_proxy_preserves_non_utf8_body() {
 }
 
 #[tokio::test]
-async fn test_proxy_preserves_content_encoding_when_decode_fails() {
+async fn test_proxy_rejects_content_encoding_when_decode_fails() {
     let (upstream_url, _upstream_handle) = start_header_echo_upstream().await;
     let (proxy_url, _proxy_handle) = start_proxy(&upstream_url).await;
 
@@ -1115,15 +1151,7 @@ async fn test_proxy_preserves_content_encoding_when_decode_fails() {
         .await
         .unwrap();
 
-    assert_eq!(
-        response
-            .headers()
-            .get("x-received-content-encoding")
-            .and_then(|value| value.to_str().ok()),
-        Some("gzip")
-    );
-    let body = response.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), corrupt_gzip.as_slice());
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1453,7 +1481,7 @@ async fn test_mitm_proxies_websocket_upgrade_and_redacts_text_frames() {
     let echoed_text = echoed.into_text().unwrap();
     assert!(
         !echoed_text.contains(secret),
-        "WebSocket frame should be redacted, got: {echoed_text}"
+        "WebSocket client and upstream frame secrets should be redacted, got: {echoed_text}"
     );
     assert!(
         echoed_text.contains("***...***"),
@@ -1691,6 +1719,36 @@ async fn test_full_scan_preserves_query_when_no_secret_changes() {
 
     let body = response.text().await.unwrap();
     assert_eq!(body, "/v1/messages?flag&x=a%20b");
+}
+
+#[tokio::test]
+async fn test_full_scan_preserves_unchanged_query_encoding_when_redacting() {
+    let (upstream_url, _upstream_handle) = start_query_echo_upstream().await;
+    let (proxy_url, _proxy_handle) = start_proxy_with_options(&upstream_url, true, "full").await;
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .get(format!(
+            "{}/v1/messages?x=a%20b&email=ada@example.com&flag",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("x=a%20b"),
+        "Unchanged query encoding should be preserved, got: {body}"
+    );
+    assert!(
+        body.contains("email=ada***...***com"),
+        "Changed query value should be redacted, got: {body}"
+    );
+    assert!(
+        body.ends_with("&flag"),
+        "Flag query segment should be preserved, got: {body}"
+    );
 }
 
 #[tokio::test]

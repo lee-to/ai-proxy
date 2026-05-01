@@ -147,30 +147,40 @@ impl RedactionContext {
     }
 
     pub fn restore_text(&self, text: &str) -> (String, BTreeMap<String, usize>) {
-        let mut restored = text.to_string();
+        let mut restored = String::with_capacity(text.len());
         let mut counts_by_category = BTreeMap::new();
+        let replacements: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.restore_allowed)
+            .flat_map(|entry| {
+                [
+                    (entry.placeholder.clone(), entry),
+                    (percent_encode_placeholder(&entry.placeholder), entry),
+                ]
+            })
+            .collect();
 
-        for entry in &self.entries {
-            if !entry.restore_allowed {
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let remaining = &text[cursor..];
+            let Some((placeholder, entry)) = replacements
+                .iter()
+                .find(|(placeholder, _)| remaining.starts_with(placeholder.as_str()))
+            else {
+                let Some(ch) = remaining.chars().next() else {
+                    break;
+                };
+                restored.push(ch);
+                cursor += ch.len_utf8();
                 continue;
-            }
+            };
 
-            let count = restored.matches(&entry.placeholder).count();
-            if count > 0 {
-                restored = restored.replace(&entry.placeholder, &entry.original);
-                *counts_by_category
-                    .entry(entry.category.clone())
-                    .or_default() += count;
-            }
-
-            let encoded_placeholder = percent_encode_placeholder(&entry.placeholder);
-            let encoded_count = restored.matches(&encoded_placeholder).count();
-            if encoded_count > 0 {
-                restored = restored.replace(&encoded_placeholder, &entry.original);
-                *counts_by_category
-                    .entry(entry.category.clone())
-                    .or_default() += encoded_count;
-            }
+            restored.push_str(&entry.original);
+            *counts_by_category
+                .entry(entry.category.clone())
+                .or_default() += 1;
+            cursor += placeholder.len();
         }
 
         debug!(
@@ -219,7 +229,20 @@ impl StreamingRestore {
             };
         }
 
-        let emit_len = self.pending.len() - keep_len;
+        let mut emit_len = self.pending.len() - keep_len;
+        emit_len = floor_utf8_boundary(&self.pending, emit_len);
+        if emit_len == 0 {
+            trace!(
+                request_id = %self.context.request_id(),
+                pending_len = self.pending.len(),
+                keep_len,
+                "Holding response chunk for UTF-8 boundary"
+            );
+            return RestoreReport {
+                bytes: Bytes::new(),
+                counts_by_category: BTreeMap::new(),
+            };
+        }
         let emit = self.pending.drain(..emit_len).collect::<Vec<_>>();
         let report = self.context.restore_bytes(Bytes::from(emit));
         trace!(
@@ -261,6 +284,34 @@ impl StreamingRestore {
             }
         }
         0
+    }
+}
+
+fn floor_utf8_boundary(bytes: &[u8], index: usize) -> usize {
+    let mut idx = index.min(bytes.len());
+    while idx > 0 && bytes[idx - 1] & 0b1100_0000 == 0b1000_0000 {
+        idx -= 1;
+    }
+    if idx == 0 {
+        return 0;
+    }
+    let leader_pos = idx - 1;
+    let leader = bytes[leader_pos];
+    let needed = if leader & 0b1000_0000 == 0 {
+        1
+    } else if leader & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if leader & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else if leader & 0b1111_1000 == 0b1111_0000 {
+        4
+    } else {
+        return leader_pos;
+    };
+    if leader_pos + needed <= index {
+        leader_pos + needed
+    } else {
+        leader_pos
     }
 }
 
@@ -337,6 +388,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_restore_holds_split_utf8_character() {
+        let mut context = RedactionContext::new("req-1", &placeholder_config());
+        let finding = ScanMatch::new("ada@example.com".to_string(), "regex", "email", 0, 15, 0.95);
+        let placeholder = context.placeholder_for(&finding);
+
+        let mut stream = StreamingRestore::new(context);
+        let text = format!("привет {placeholder}");
+        let first = stream.push(Bytes::copy_from_slice(&text.as_bytes()[..1]));
+        let second = stream.push(Bytes::copy_from_slice(&text.as_bytes()[1..]));
+        let tail = stream.finish();
+
+        let mut combined = [first.bytes, second.bytes].concat();
+        if let Some(tail) = tail {
+            combined.extend_from_slice(&tail.bytes);
+        }
+        assert_eq!(
+            String::from_utf8(combined).unwrap(),
+            "привет ada@example.com"
+        );
+    }
+
+    #[test]
     fn account_number_restores_only_when_configured_as_restorable() {
         let mut config = placeholder_config();
         config
@@ -361,5 +434,21 @@ mod tests {
         assert_eq!(placeholder, "[ACCOUNT_NUMBER_1]");
         assert_eq!(restored, "number=79222222222");
         assert_eq!(counts["account_number"], 1);
+    }
+
+    #[test]
+    fn restore_text_does_not_restore_placeholders_inside_original_values() {
+        let mut context = RedactionContext::new("req-1", &placeholder_config());
+        let first = ScanMatch::new("[EMAIL_2]".to_string(), "regex", "email", 0, 9, 0.95);
+        let second = ScanMatch::new("ada@example.com".to_string(), "regex", "email", 0, 15, 0.95);
+        let first_placeholder = context.placeholder_for(&first);
+        let second_placeholder = context.placeholder_for(&second);
+
+        let (restored, counts) = context.restore_text(&first_placeholder);
+
+        assert_eq!(first_placeholder, "[EMAIL_1]");
+        assert_eq!(second_placeholder, "[EMAIL_2]");
+        assert_eq!(restored, "[EMAIL_2]");
+        assert_eq!(counts["email"], 1);
     }
 }

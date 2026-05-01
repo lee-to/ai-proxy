@@ -1,8 +1,7 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
 use crate::telemetry::{
@@ -76,11 +75,28 @@ impl TelemetryStore {
         self.retention_hours
     }
 
+    async fn with_connection<R, F>(&self, operation: F) -> rusqlite::Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> rusqlite::Result<R> + Send + 'static,
+    {
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| sqlite_runtime_error("telemetry SQLite connection lock poisoned"))?;
+            operation(&connection)
+        })
+        .await
+        .map_err(|error| sqlite_runtime_error(&format!("telemetry SQLite task failed: {error}")))?
+    }
+
     async fn initialize_schema(&self) -> rusqlite::Result<()> {
         debug!("Initializing telemetry schema");
-        let connection = self.connection.lock().await;
-        connection.execute_batch(
-            r#"
+        self.with_connection(|connection| {
+            connection.execute_batch(
+                r#"
+            PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
 
@@ -150,7 +166,9 @@ impl TelemetryStore {
             CREATE INDEX IF NOT EXISTS idx_content_captures_request_id
                 ON content_captures(request_id);
             "#,
-        )?;
+            )
+        })
+        .await?;
         info!("Telemetry schema ready");
         Ok(())
     }
@@ -169,10 +187,12 @@ impl TelemetryStore {
             "Persisting telemetry request"
         );
 
-        let connection = self.connection.lock().await;
-        if let Err(error) = connection.execute(
-            r#"
-            INSERT OR REPLACE INTO requests (
+        let request = request.clone();
+        let log_request_id = request.request_id.clone();
+        self.with_connection(move |connection| {
+            connection.execute(
+                r#"
+            INSERT INTO requests (
                 request_id,
                 started_at_ms,
                 completed_at_ms,
@@ -184,29 +204,42 @@ impl TelemetryStore {
                 status_code,
                 error
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(request_id) DO UPDATE SET
+                started_at_ms = excluded.started_at_ms,
+                completed_at_ms = excluded.completed_at_ms,
+                method = excluded.method,
+                path = excluded.path,
+                mode = excluded.mode,
+                upstream = excluded.upstream,
+                model = excluded.model,
+                status_code = excluded.status_code,
+                error = excluded.error
             "#,
-            params![
-                request.request_id,
-                request.started_at_ms,
-                request.completed_at_ms,
-                request.method,
-                request.path,
-                request.mode,
-                request.upstream,
-                request.model,
-                request.status_code.map(i64::from),
-                request.error,
-            ],
-        ) {
+                params![
+                    request.request_id,
+                    request.started_at_ms,
+                    request.completed_at_ms,
+                    request.method,
+                    request.path,
+                    request.mode,
+                    request.upstream,
+                    request.model,
+                    request.status_code.map(i64::from),
+                    request.error,
+                ],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
             error!(
-                request_id = %request.request_id,
+                request_id = %log_request_id,
                 table = "requests",
                 error = %error,
                 "Failed to persist telemetry request"
             );
-            return Err(error);
-        }
-        Ok(())
+            error
+        })
     }
 
     pub async fn finish_request(
@@ -223,31 +256,37 @@ impl TelemetryStore {
             "Finishing telemetry request"
         );
 
-        let connection = self.connection.lock().await;
-        if let Err(error) = connection.execute(
-            r#"
+        let request_id = request_id.to_string();
+        let log_request_id = request_id.clone();
+        let error_message = error_message.map(ToOwned::to_owned);
+        self.with_connection(move |connection| {
+            connection.execute(
+                r#"
             UPDATE requests
             SET completed_at_ms = ?2,
                 status_code = ?3,
                 error = ?4
             WHERE request_id = ?1
             "#,
-            params![
-                request_id,
-                completed_at_ms,
-                status_code.map(i64::from),
-                error_message,
-            ],
-        ) {
+                params![
+                    request_id,
+                    completed_at_ms,
+                    status_code.map(i64::from),
+                    error_message,
+                ],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
             error!(
-                request_id,
+                request_id = %log_request_id,
                 table = "requests",
                 error = %error,
                 "Failed to finish telemetry request"
             );
-            return Err(error);
-        }
-        Ok(())
+            error
+        })
     }
 
     pub async fn insert_usage(&self, usage: &TokenUsageRecord) -> rusqlite::Result<()> {
@@ -262,9 +301,11 @@ impl TelemetryStore {
             "Persisting token usage telemetry"
         );
 
-        let connection = self.connection.lock().await;
-        if let Err(error) = connection.execute(
-            r#"
+        let usage = usage.clone();
+        let log_request_id = usage.request_id.clone();
+        self.with_connection(move |connection| {
+            connection.execute(
+                r#"
             INSERT INTO usage_events (
                 request_id,
                 observed_at_ms,
@@ -276,26 +317,29 @@ impl TelemetryStore {
                 total_tokens
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
-            params![
-                usage.request_id,
-                usage.observed_at_ms,
-                usage.model,
-                usage.upstream,
-                usage.source,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.total_tokens,
-            ],
-        ) {
+                params![
+                    usage.request_id,
+                    usage.observed_at_ms,
+                    usage.model,
+                    usage.upstream,
+                    usage.source,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.total_tokens,
+                ],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
             error!(
-                request_id = %usage.request_id,
+                request_id = %log_request_id,
                 table = "usage_events",
                 error = %error,
                 "Failed to persist token usage telemetry"
             );
-            return Err(error);
-        }
-        Ok(())
+            error
+        })
     }
 
     pub async fn insert_tool_event(&self, event: &ToolEventRecord) -> rusqlite::Result<()> {
@@ -309,9 +353,11 @@ impl TelemetryStore {
             "Persisting tool event telemetry"
         );
 
-        let connection = self.connection.lock().await;
-        if let Err(error) = connection.execute(
-            r#"
+        let event = event.clone();
+        let log_request_id = event.request_id.clone();
+        self.with_connection(move |connection| {
+            connection.execute(
+                r#"
             INSERT INTO tool_events (
                 request_id,
                 observed_at_ms,
@@ -322,25 +368,28 @@ impl TelemetryStore {
                 source
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
-            params![
-                event.request_id,
-                event.observed_at_ms,
-                event.event_kind,
-                event.tool_name,
-                event.call_id,
-                event.status,
-                event.source,
-            ],
-        ) {
+                params![
+                    event.request_id,
+                    event.observed_at_ms,
+                    event.event_kind,
+                    event.tool_name,
+                    event.call_id,
+                    event.status,
+                    event.source,
+                ],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
             error!(
-                request_id = %event.request_id,
+                request_id = %log_request_id,
                 table = "tool_events",
                 error = %error,
                 "Failed to persist tool event telemetry"
             );
-            return Err(error);
-        }
-        Ok(())
+            error
+        })
     }
 
     pub async fn insert_content_capture(
@@ -358,9 +407,11 @@ impl TelemetryStore {
             "Persisting content capture telemetry"
         );
 
-        let connection = self.connection.lock().await;
-        if let Err(error) = connection.execute(
-            r#"
+        let capture = capture.clone();
+        let log_request_id = capture.request_id.clone();
+        self.with_connection(move |connection| {
+            connection.execute(
+                r#"
             INSERT INTO content_captures (
                 request_id,
                 observed_at_ms,
@@ -372,48 +423,62 @@ impl TelemetryStore {
                 redacted
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
-            params![
-                capture.request_id,
-                capture.observed_at_ms,
-                capture.direction,
-                capture.source,
-                capture.content_type,
-                capture.preview_text,
-                capture.truncated as i64,
-                capture.redacted as i64,
-            ],
-        ) {
+                params![
+                    capture.request_id,
+                    capture.observed_at_ms,
+                    capture.direction,
+                    capture.source,
+                    capture.content_type,
+                    capture.preview_text,
+                    capture.truncated as i64,
+                    capture.redacted as i64,
+                ],
+            )
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
             error!(
-                request_id = %capture.request_id,
+                request_id = %log_request_id,
                 table = "content_captures",
                 error = %error,
                 "Failed to persist content capture telemetry"
             );
-            return Err(error);
-        }
-        Ok(())
+            error
+        })
     }
 
     pub async fn purge_expired(&self) -> rusqlite::Result<usize> {
         let cutoff_ms = window_start_ms(self.retention_hours);
         debug!(cutoff_ms, "Purging expired telemetry rows");
-        let connection = self.connection.lock().await;
-        let deleted_content_captures = connection.execute(
-            "DELETE FROM content_captures WHERE observed_at_ms < ?1",
-            params![cutoff_ms],
-        )?;
-        let deleted_tool_events = connection.execute(
-            "DELETE FROM tool_events WHERE observed_at_ms < ?1",
-            params![cutoff_ms],
-        )?;
-        let deleted_usage_events = connection.execute(
-            "DELETE FROM usage_events WHERE observed_at_ms < ?1",
-            params![cutoff_ms],
-        )?;
-        let deleted_requests = connection.execute(
-            "DELETE FROM requests WHERE started_at_ms < ?1",
-            params![cutoff_ms],
-        )?;
+        let (deleted_content_captures, deleted_tool_events, deleted_usage_events, deleted_requests) =
+            self.with_connection(move |connection| {
+                let tx = connection.unchecked_transaction()?;
+                let deleted_content_captures = tx.execute(
+                    "DELETE FROM content_captures WHERE observed_at_ms < ?1",
+                    params![cutoff_ms],
+                )?;
+                let deleted_tool_events = tx.execute(
+                    "DELETE FROM tool_events WHERE observed_at_ms < ?1",
+                    params![cutoff_ms],
+                )?;
+                let deleted_usage_events = tx.execute(
+                    "DELETE FROM usage_events WHERE observed_at_ms < ?1",
+                    params![cutoff_ms],
+                )?;
+                let deleted_requests = tx.execute(
+                    "DELETE FROM requests WHERE started_at_ms < ?1",
+                    params![cutoff_ms],
+                )?;
+                tx.commit()?;
+                Ok((
+                    deleted_content_captures,
+                    deleted_tool_events,
+                    deleted_usage_events,
+                    deleted_requests,
+                ))
+            })
+            .await?;
         let deleted = deleted_content_captures
             + deleted_tool_events
             + deleted_usage_events
@@ -434,10 +499,15 @@ impl TelemetryStore {
         let generated_at_ms = now_ms();
         debug!(window_hours, window_start, "Querying usage dashboard");
 
-        let connection = self.connection.lock().await;
-        let totals = query_usage_totals(&connection, window_start)?;
-        let by_model = query_usage_breakdown(&connection, "model", window_start)?;
-        let by_upstream = query_usage_breakdown(&connection, "upstream", window_start)?;
+        let (totals, by_model, by_upstream) = self
+            .with_connection(move |connection| {
+                Ok((
+                    query_usage_totals(connection, window_start)?,
+                    query_usage_breakdown(connection, "model", window_start)?,
+                    query_usage_breakdown(connection, "upstream", window_start)?,
+                ))
+            })
+            .await?;
         debug!(
             window_hours,
             by_model_rows = by_model.len(),
@@ -466,9 +536,10 @@ impl TelemetryStore {
             limit, window_start, "Querying tool history dashboard"
         );
 
-        let connection = self.connection.lock().await;
-        let mut statement = connection.prepare(
-            r#"
+        let events = self
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    r#"
             SELECT observed_at_ms, request_id, event_kind, tool_name, call_id, status, source
             FROM tool_events
             WHERE observed_at_ms >= ?1
@@ -476,20 +547,22 @@ impl TelemetryStore {
             ORDER BY observed_at_ms DESC
             LIMIT ?2
             "#,
-        )?;
-        let events = statement
-            .query_map(params![window_start, limit as i64], |row| {
-                Ok(ToolEventView {
-                    observed_at_ms: row.get(0)?,
-                    request_id: row.get(1)?,
-                    event_kind: row.get(2)?,
-                    tool_name: row.get(3)?,
-                    call_id: row.get(4)?,
-                    status: row.get(5)?,
-                    source: row.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                )?;
+                statement
+                    .query_map(params![window_start, limit as i64], |row| {
+                        Ok(ToolEventView {
+                            observed_at_ms: row.get(0)?,
+                            request_id: row.get(1)?,
+                            event_kind: row.get(2)?,
+                            tool_name: row.get(3)?,
+                            call_id: row.get(4)?,
+                            status: row.get(5)?,
+                            source: row.get(6)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?;
 
         debug!(
             event_count = events.len(),
@@ -514,7 +587,6 @@ impl TelemetryStore {
             limit, window_start, "Querying error dashboard"
         );
 
-        let connection = self.connection.lock().await;
         let primary_sql = format!(
             r#"
             SELECT
@@ -557,9 +629,14 @@ impl TelemetryStore {
             "#
         );
 
-        let errors = query_error_events(&connection, &primary_sql, window_start, limit)?;
-        let auxiliary_errors =
-            query_error_events(&connection, &auxiliary_sql, window_start, limit)?;
+        let (errors, auxiliary_errors) = self
+            .with_connection(move |connection| {
+                Ok((
+                    query_error_events(connection, &primary_sql, window_start, limit)?,
+                    query_error_events(connection, &auxiliary_sql, window_start, limit)?,
+                ))
+            })
+            .await?;
 
         debug!(
             error_count = errors.len(),
@@ -586,9 +663,10 @@ impl TelemetryStore {
             limit, window_start, "Querying request timeline dashboard"
         );
 
-        let connection = self.connection.lock().await;
-        let mut statement = connection.prepare(
-            r#"
+        let events = self
+            .with_connection(move |connection| {
+                let mut statement = connection.prepare(
+                    r#"
             SELECT
                 r.started_at_ms,
                 r.completed_at_ms,
@@ -657,34 +735,36 @@ impl TelemetryStore {
             ORDER BY r.started_at_ms DESC
             LIMIT ?2
             "#,
-        )?;
-        let events = statement
-            .query_map(params![window_start, limit as i64], |row| {
-                let status_code: Option<i64> = row.get(8)?;
-                let request_truncated: i64 = row.get(15)?;
-                let response_truncated: i64 = row.get(17)?;
-                Ok(RequestTimelineItem {
-                    started_at_ms: row.get(0)?,
-                    completed_at_ms: row.get(1)?,
-                    request_id: row.get(2)?,
-                    method: row.get(3)?,
-                    path: row.get(4)?,
-                    mode: row.get(5)?,
-                    upstream: row.get(6)?,
-                    model: row.get(7)?,
-                    status_code: status_code.and_then(|value| u16::try_from(value).ok()),
-                    error: row.get(9)?,
-                    input_tokens: row.get(10)?,
-                    output_tokens: row.get(11)?,
-                    total_tokens: row.get(12)?,
-                    tool_event_count: row.get(13)?,
-                    request_preview: row.get(14)?,
-                    request_truncated: request_truncated != 0,
-                    response_preview: row.get(16)?,
-                    response_truncated: response_truncated != 0,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+                )?;
+                statement
+                    .query_map(params![window_start, limit as i64], |row| {
+                        let status_code: Option<i64> = row.get(8)?;
+                        let request_truncated: i64 = row.get(15)?;
+                        let response_truncated: i64 = row.get(17)?;
+                        Ok(RequestTimelineItem {
+                            started_at_ms: row.get(0)?,
+                            completed_at_ms: row.get(1)?,
+                            request_id: row.get(2)?,
+                            method: row.get(3)?,
+                            path: row.get(4)?,
+                            mode: row.get(5)?,
+                            upstream: row.get(6)?,
+                            model: row.get(7)?,
+                            status_code: status_code.and_then(|value| u16::try_from(value).ok()),
+                            error: row.get(9)?,
+                            input_tokens: row.get(10)?,
+                            output_tokens: row.get(11)?,
+                            total_tokens: row.get(12)?,
+                            tool_event_count: row.get(13)?,
+                            request_preview: row.get(14)?,
+                            request_truncated: request_truncated != 0,
+                            response_preview: row.get(16)?,
+                            response_truncated: response_truncated != 0,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?;
 
         debug!(
             event_count = events.len(),
@@ -823,16 +903,23 @@ fn query_usage_breakdown(
 }
 
 pub async fn request_exists(store: &TelemetryStore, request_id: &str) -> rusqlite::Result<bool> {
-    let connection = store.connection.lock().await;
-    let found = connection
-        .query_row(
-            "SELECT 1 FROM requests WHERE request_id = ?1",
-            params![request_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    Ok(found)
+    let request_id = request_id.to_string();
+    store
+        .with_connection(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT 1 FROM requests WHERE request_id = ?1",
+                    params![request_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+        .await
+}
+
+fn sqlite_runtime_error(message: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(message.to_string())))
 }
 
 #[cfg(test)]
