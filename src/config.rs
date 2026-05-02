@@ -54,6 +54,8 @@ pub struct ProxyConfig {
 pub struct DashboardConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auth_enabled: bool,
     #[serde(default = "default_dashboard_listen_addr")]
     pub listen_addr: String,
     #[serde(default = "default_dashboard_token_path")]
@@ -70,6 +72,7 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auth_enabled: true,
             listen_addr: default_dashboard_listen_addr(),
             token_path: default_dashboard_token_path(),
             sqlite_path: default_dashboard_sqlite_path(),
@@ -344,6 +347,7 @@ impl Config {
             mitm_excluded_hosts = config.proxy.mitm_excluded_hosts.len(),
             websocket_mode = %config.proxy.websocket_mode,
             dashboard_enabled = config.dashboard.enabled,
+            dashboard_auth_enabled = config.dashboard.auth_enabled,
             dashboard_listen_addr = %config.dashboard.listen_addr,
             dashboard_retention_hours = config.dashboard.retention_hours,
             dashboard_sqlite_path_set = !config.dashboard.sqlite_path.as_os_str().is_empty(),
@@ -409,6 +413,10 @@ impl Config {
         );
         override_string("AI_PROXY_WEBSOCKET_MODE", &mut self.proxy.websocket_mode);
         override_bool("AI_PROXY_DASHBOARD_ENABLED", &mut self.dashboard.enabled)?;
+        override_bool(
+            "AI_PROXY_DASHBOARD_AUTH_ENABLED",
+            &mut self.dashboard.auth_enabled,
+        )?;
         override_string(
             "AI_PROXY_DASHBOARD_LISTEN_ADDR",
             &mut self.dashboard.listen_addr,
@@ -910,6 +918,7 @@ mod tests {
             },
             dashboard: DashboardConfig {
                 enabled: true,
+                auth_enabled: true,
                 listen_addr: listen_addr.to_string(),
                 token_path: default_dashboard_token_path(),
                 sqlite_path: default_dashboard_sqlite_path(),

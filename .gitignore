@@ -1,5 +1,8 @@
 /target
 config.toml
+.env
+.env.*
+!.env.example
 .ai-factory
 .idea
 .claude
@@ -7,6 +10,9 @@ config.toml
 .ai-factory.json
 certs
 /pii
+*.log
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.pem
+*.key

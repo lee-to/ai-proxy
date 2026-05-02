@@ -1050,6 +1050,24 @@ mod tests {
 
         assert_eq!(upstream, "https://api.anthropic.com/v1/messages?x=1");
     }
+
+    #[test]
+    fn websocket_upstream_request_strips_extensions() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static("permessage-deflate"),
+        );
+        headers.insert("authorization", HeaderValue::from_static("Bearer token"));
+
+        let request = build_websocket_upstream_request("wss://example.test/ws", &headers).unwrap();
+
+        assert!(request.headers().get(SEC_WEBSOCKET_EXTENSIONS).is_none());
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer token"
+        );
+    }
 }
 
 fn is_mitm_excluded_host(state: &AppState, host: &str) -> bool {
@@ -1337,16 +1355,6 @@ async fn handle_mitm_websocket_upgrade(
             .headers_mut()
             .insert(HeaderName::from_static(SEC_WEBSOCKET_PROTOCOL), protocol);
     }
-    if let Some(extensions) = upstream_response
-        .headers()
-        .get(SEC_WEBSOCKET_EXTENSIONS)
-        .cloned()
-    {
-        response.headers_mut().insert(
-            HeaderName::from_static(SEC_WEBSOCKET_EXTENSIONS),
-            extensions,
-        );
-    }
     response
 }
 
@@ -1578,6 +1586,9 @@ fn build_websocket_upstream_request(
     for (name, value) in headers.iter() {
         let name_lower = name.as_str().to_ascii_lowercase();
         if is_websocket_hop_header(&name_lower) {
+            if name_lower == SEC_WEBSOCKET_EXTENSIONS {
+                debug!("Stripping WebSocket extensions for MITM frame inspection");
+            }
             continue;
         }
         upstream_request
@@ -1716,6 +1727,7 @@ fn is_websocket_hop_header(name: &str) -> bool {
             | "host"
             | SEC_WEBSOCKET_ACCEPT
             | SEC_WEBSOCKET_KEY
+            | SEC_WEBSOCKET_EXTENSIONS
             | SEC_WEBSOCKET_VERSION
     )
 }

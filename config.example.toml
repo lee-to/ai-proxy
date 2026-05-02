@@ -18,6 +18,7 @@ websocket_mode = "inspect"                       # reject | passthrough | inspec
 
 [dashboard]
 enabled = false
+auth_enabled = true                                 # set false only when dashboard is reachable through a trusted loopback/tunnel path
 listen_addr = "127.0.0.1:18081"                  # loopback only; use ssh -L for remote access
 token_path = "~/.ai-proxy/dashboard.token"       # generated on first start; use an absolute path like /etc/ai-proxy/dashboard.token for systemd/prod
 sqlite_path = "ai-proxy-telemetry.sqlite"

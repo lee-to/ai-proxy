@@ -32,7 +32,7 @@ Codex CLI    -->  ai-proxy (localhost:8080)  -->  api.openai.com
 
 ```bash
 # 1. Clone and build
-git clone <repo-url> && cd ai-proxy
+git clone https://github.com/lee-to/ai-proxy.git && cd ai-proxy
 cp config.example.toml config.toml
 cargo build --release
 
@@ -162,15 +162,15 @@ Configure Codex globally with `~/.codex/.env`:
 HTTPS_PROXY=http://server:8080
 HTTP_PROXY=http://server:8080
 SSL_CERT_FILE=/Users/macos/ai-proxy-ca.pem
-NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
-no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
+no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
 ```
 
 Codex loads `~/.codex/.env` into its process environment. Commands started from
 Codex, including `gh`, `git`, and `curl`, inherit these variables and will use the
 same proxy unless a host matches `NO_PROXY` or `no_proxy`. Keep GitHub,
-`ghcr.io`, and `auth.docker.io` in `NO_PROXY` unless you intentionally want
-GitHub CLI, Homebrew, or Docker registry auth traffic to pass through the local MITM CA. Do not add
+`ghcr.io`, `auth.docker.io`, and `crates.io` in `NO_PROXY` unless you intentionally want
+GitHub CLI, Homebrew, Cargo, or Docker registry auth traffic to pass through the local MITM CA. Do not add
 `chatgpt.com`, `api.openai.com`, or `api.anthropic.com` when you want model
 traffic, token usage, and tool history to be visible in the dashboard.
 
@@ -415,6 +415,7 @@ The adapter response must use UTF-8 byte offsets in the exact request text:
 ```toml
 [dashboard]
 enabled = false
+auth_enabled = true
 listen_addr = "127.0.0.1:18081"   # loopback only; use SSH tunneling for remote access
 token_path = "~/.ai-proxy/dashboard.token"
 sqlite_path = "ai-proxy-telemetry.sqlite"
@@ -427,7 +428,9 @@ max_body_bytes = 8192
 redact_before_store = true
 ```
 
-The dashboard listener is intentionally separate from the proxy listener and must bind to a loopback address. A random token is generated at `token_path` on first start; pass it as `Authorization: Bearer <token>` or open the dashboard with `?token=<token>`. Query-string tokens are accepted for browser convenience; the dashboard sends `Referrer-Policy: no-referrer`, removes the token from the address bar after load, and uses an `Authorization` header for API refreshes.
+The dashboard listener is intentionally separate from the proxy listener and must bind to a loopback address. With `auth_enabled = true`, a random token is generated at `token_path` on first start; pass it as `Authorization: Bearer <token>` or open the dashboard with `?token=<token>`. Query-string tokens are accepted for browser convenience; the dashboard sends `Referrer-Policy: no-referrer`, removes the token from the address bar after load, and uses an `Authorization` header for API refreshes.
+
+Set `auth_enabled = false` only when the dashboard is reachable exclusively through a trusted local or SSH-tunneled path. In that mode, the dashboard does not create or require a token.
 
 Enable it on the server and reach it through an SSH tunnel:
 
@@ -506,6 +509,7 @@ AI_PROXY_MITM_CERT_CACHE_SIZE=256
 AI_PROXY_MITM_EXCLUDED_HOSTS=example.com,internal.example
 AI_PROXY_WEBSOCKET_MODE=inspect
 AI_PROXY_DASHBOARD_ENABLED=false
+AI_PROXY_DASHBOARD_AUTH_ENABLED=true
 AI_PROXY_DASHBOARD_LISTEN_ADDR=127.0.0.1:18081
 AI_PROXY_DASHBOARD_TOKEN_PATH=~/.ai-proxy/dashboard.token
 AI_PROXY_DASHBOARD_SQLITE_PATH=ai-proxy-telemetry.sqlite
@@ -606,8 +610,8 @@ Some Codex modes ignore `OPENAI_BASE_URL` and use `HTTPS_PROXY` with `CONNECT` t
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:8080
 export HTTP_PROXY=http://127.0.0.1:8080
-export NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
-export no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+export NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
+export no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
 codex
 ```
 
@@ -641,8 +645,8 @@ Then start Codex from another terminal with the proxy and CA bundle:
 export HTTPS_PROXY=http://127.0.0.1:8080
 export HTTP_PROXY=http://127.0.0.1:8080
 export SSL_CERT_FILE=/Users/macos/Projects/2080/ai-proxy/certs/ai-proxy-ca.pem
-export NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
-export no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+export NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
+export no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
 codex
 ```
 
@@ -658,11 +662,11 @@ Create or edit `~/.codex/.env`:
 HTTPS_PROXY=http://127.0.0.1:8080
 HTTP_PROXY=http://127.0.0.1:8080
 SSL_CERT_FILE=/Users/macos/Projects/2080/ai-proxy/certs/ai-proxy-ca.pem
-NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
-no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
+no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
 ```
 
-After that, `codex` can be started without per-shell exports. Codex filters `CODEX_` variables from this dotenv file, so set `CODEX_HOME` in the OS shell or service manager if you need a non-default Codex home. The dotenv values become normal process environment variables, so subprocesses launched by Codex inherit them. `NO_PROXY`/`no_proxy` keeps GitHub tooling, Homebrew downloads, and GitHub Container Registry pulls from being sent through the MITM proxy and avoids certificate trust failures in tools that do not use `SSL_CERT_FILE`.
+After that, `codex` can be started without per-shell exports. Codex filters `CODEX_` variables from this dotenv file, so set `CODEX_HOME` in the OS shell or service manager if you need a non-default Codex home. The dotenv values become normal process environment variables, so subprocesses launched by Codex inherit them. `NO_PROXY`/`no_proxy` keeps GitHub tooling, Homebrew downloads, Cargo registry access, and GitHub Container Registry pulls from being sent through the MITM proxy and avoids certificate trust failures in tools that do not use `SSL_CERT_FILE`.
 
 ### GitHub CLI and Proxy Inheritance
 
@@ -672,12 +676,12 @@ managers, and test runners inherit those variables. That is useful for AI client
 traffic, but it can accidentally route unrelated HTTPS traffic through the MITM
 proxy.
 
-Keep GitHub, `ghcr.io`, and `auth.docker.io` in `NO_PROXY` unless you explicitly
-want to inspect GitHub or Docker registry auth traffic:
+Keep GitHub, `ghcr.io`, `auth.docker.io`, and `crates.io` in `NO_PROXY` unless you explicitly
+want to inspect GitHub, Cargo, or Docker registry auth traffic:
 
 ```dotenv
-NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
-no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io
+NO_PROXY=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
+no_proxy=localhost,127.0.0.1,::1,github.com,.github.com,api.github.com,githubusercontent.com,.githubusercontent.com,ghcr.io,.ghcr.io,auth.docker.io,crates.io,.crates.io,index.crates.io,static.crates.io
 ```
 
 To confirm what a command will use, run:
@@ -898,6 +902,14 @@ tests/
 config.toml                      # runtime configuration
 ```
 
+## Community
+
+- Contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- Security reports: [SECURITY.md](SECURITY.md)
+- Support: [SUPPORT.md](SUPPORT.md)
+- Changes: [CHANGELOG.md](CHANGELOG.md)
+
 ## License
 
-MIT
+MIT License. See [LICENSE](LICENSE).

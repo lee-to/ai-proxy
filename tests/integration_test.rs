@@ -1465,10 +1465,21 @@ async fn test_mitm_proxies_websocket_upgrade_and_redacts_text_frames() {
         "authorization",
         "Bearer opaque-subscription-token".parse().unwrap(),
     );
+    request.headers_mut().insert(
+        "sec-websocket-extensions",
+        "permessage-deflate".parse().unwrap(),
+    );
     let (mut websocket, handshake_response) = client_async(request, tls_stream).await.unwrap();
     assert_eq!(
         handshake_response.status(),
         tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
+    );
+    assert!(
+        handshake_response
+            .headers()
+            .get("sec-websocket-extensions")
+            .is_none(),
+        "MITM frame inspection must not negotiate compression extensions"
     );
 
     let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";

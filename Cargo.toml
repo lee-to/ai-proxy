@@ -2,6 +2,24 @@
 name = "ai-proxy"
 version = "0.1.0"
 edition = "2024"
+authors = ["Danil Shutsky <thecutcode@gmail.com>"]
+description = "Secret redaction reverse proxy for AI coding clients and model APIs"
+license = "MIT"
+repository = "https://github.com/lee-to/ai-proxy"
+readme = "README.md"
+keywords = ["proxy", "security", "redaction", "ai", "mitm"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/config.example.toml",
+    "/.env.example",
+]
 
 [dependencies]
 axum = "0.8"

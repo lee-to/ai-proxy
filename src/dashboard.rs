@@ -21,10 +21,17 @@ use crate::telemetry_store::TelemetryStore;
 #[derive(Clone)]
 pub struct DashboardState {
     store: Arc<TelemetryStore>,
-    token: Arc<String>,
+    token: Option<Arc<String>>,
 }
 
 pub fn dashboard_router(store: Arc<TelemetryStore>, token: String) -> Router {
+    dashboard_router_with_optional_token(store, Some(token))
+}
+
+fn dashboard_router_with_optional_token(
+    store: Arc<TelemetryStore>,
+    token: Option<String>,
+) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/usage/day", get(usage_day))
@@ -33,7 +40,7 @@ pub fn dashboard_router(store: Arc<TelemetryStore>, token: String) -> Router {
         .route("/api/timeline/day", get(timeline_day))
         .with_state(DashboardState {
             store,
-            token: Arc::new(token),
+            token: token.map(Arc::new),
         })
 }
 
@@ -49,29 +56,42 @@ pub async fn serve_dashboard(
         );
         return Err("dashboard listen address must be loopback-only".into());
     }
-    let token_path = expand_home_path(&config.token_path);
-    let token = ensure_dashboard_token(&token_path)?;
+    let token = if config.auth_enabled {
+        let token_path = expand_home_path(&config.token_path);
+        let token = ensure_dashboard_token(&token_path)?;
+        info!(
+            listen_addr = %listen_addr,
+            token_path = %token_path.display(),
+            "Dashboard token authentication enabled"
+        );
+        Some(token)
+    } else {
+        warn!(
+            listen_addr = %listen_addr,
+            "Dashboard token authentication disabled"
+        );
+        None
+    };
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(
         listen_addr = %listen_addr,
-        token_path = %token_path.display(),
         "Dashboard server started"
     );
-    axum::serve(listener, dashboard_router(store, token)).await?;
+    axum::serve(listener, dashboard_router_with_optional_token(store, token)).await?;
     Ok(())
 }
 
 async fn index(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
     debug!("Serving dashboard HTML");
-    if !is_authorized(&state.token, &headers, &uri) {
+    if !is_authorized(state.token.as_deref().map(String::as_str), &headers, &uri) {
         return unauthorized_response();
     }
     ([("referrer-policy", "no-referrer")], Html(DASHBOARD_HTML)).into_response()
 }
 
 async fn usage_day(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
-    if !is_authorized(&state.token, &headers, &uri) {
+    if !is_authorized(state.token.as_deref().map(String::as_str), &headers, &uri) {
         return unauthorized_response();
     }
     let started = Instant::now();
@@ -100,7 +120,7 @@ async fn usage_day(State(state): State<DashboardState>, headers: HeaderMap, uri:
 }
 
 async fn tools_day(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
-    if !is_authorized(&state.token, &headers, &uri) {
+    if !is_authorized(state.token.as_deref().map(String::as_str), &headers, &uri) {
         return unauthorized_response();
     }
     let started = Instant::now();
@@ -128,7 +148,7 @@ async fn tools_day(State(state): State<DashboardState>, headers: HeaderMap, uri:
 }
 
 async fn errors_day(State(state): State<DashboardState>, headers: HeaderMap, uri: Uri) -> Response {
-    if !is_authorized(&state.token, &headers, &uri) {
+    if !is_authorized(state.token.as_deref().map(String::as_str), &headers, &uri) {
         return unauthorized_response();
     }
     let started = Instant::now();
@@ -160,7 +180,7 @@ async fn timeline_day(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if !is_authorized(&state.token, &headers, &uri) {
+    if !is_authorized(state.token.as_deref().map(String::as_str), &headers, &uri) {
         return unauthorized_response();
     }
     let started = Instant::now();
@@ -233,7 +253,11 @@ fn ensure_dashboard_token(path: &Path) -> Result<String, Box<dyn std::error::Err
     Ok(token)
 }
 
-fn is_authorized(token: &str, headers: &HeaderMap, uri: &Uri) -> bool {
+fn is_authorized(token: Option<&str>, headers: &HeaderMap, uri: &Uri) -> bool {
+    let Some(token) = token else {
+        return true;
+    };
+
     if headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -722,6 +746,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_accepts_missing_dashboard_token_when_auth_disabled() {
+        let store = Arc::new(TelemetryStore::open_in_memory(24).await.unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = dashboard_router_with_optional_token(store, None);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!("http://{addr}/api/usage/day"))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert!(status.is_success(), "status={status}, body={text}");
 
         handle.abort();
     }
