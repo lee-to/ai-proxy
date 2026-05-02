@@ -43,7 +43,7 @@ governor = "0.8"
 getrandom = "0.3"
 url = "2"
 zstd = "0.13"
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
