@@ -455,15 +455,33 @@ impl TelemetryStore {
             self.with_connection(move |connection| {
                 let tx = connection.unchecked_transaction()?;
                 let deleted_content_captures = tx.execute(
-                    "DELETE FROM content_captures WHERE observed_at_ms < ?1",
+                    r#"
+                    DELETE FROM content_captures
+                    WHERE observed_at_ms < ?1
+                       OR request_id IN (
+                           SELECT request_id FROM requests WHERE started_at_ms < ?1
+                       )
+                    "#,
                     params![cutoff_ms],
                 )?;
                 let deleted_tool_events = tx.execute(
-                    "DELETE FROM tool_events WHERE observed_at_ms < ?1",
+                    r#"
+                    DELETE FROM tool_events
+                    WHERE observed_at_ms < ?1
+                       OR request_id IN (
+                           SELECT request_id FROM requests WHERE started_at_ms < ?1
+                       )
+                    "#,
                     params![cutoff_ms],
                 )?;
                 let deleted_usage_events = tx.execute(
-                    "DELETE FROM usage_events WHERE observed_at_ms < ?1",
+                    r#"
+                    DELETE FROM usage_events
+                    WHERE observed_at_ms < ?1
+                       OR request_id IN (
+                           SELECT request_id FROM requests WHERE started_at_ms < ?1
+                       )
+                    "#,
                     params![cutoff_ms],
                 )?;
                 let deleted_requests = tx.execute(
@@ -993,6 +1011,70 @@ mod tests {
         let deleted = store.purge_expired().await.unwrap();
         assert_eq!(deleted, 1);
         assert!(!request_exists(&store, "req-old").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn purges_children_for_expired_requests_even_when_children_are_recent() {
+        let store = TelemetryStore::open_in_memory(24).await.unwrap();
+        let old = now_ms() - (25 * 60 * 60 * 1000);
+        let recent = now_ms();
+        store
+            .insert_request(&RequestRecord {
+                request_id: "req-expired-parent".to_string(),
+                started_at_ms: old,
+                completed_at_ms: Some(old),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                mode: "reverse".to_string(),
+                upstream: "https://api.openai.com".to_string(),
+                model: Some("gpt-test".to_string()),
+                status_code: Some(200),
+                error: None,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_usage(&TokenUsageRecord {
+                request_id: "req-expired-parent".to_string(),
+                observed_at_ms: recent,
+                model: Some("gpt-test".to_string()),
+                upstream: "https://api.openai.com".to_string(),
+                source: "response".to_string(),
+                input_tokens: Some(10),
+                output_tokens: Some(15),
+                total_tokens: Some(25),
+            })
+            .await
+            .unwrap();
+        store
+            .insert_tool_event(&ToolEventRecord {
+                request_id: "req-expired-parent".to_string(),
+                observed_at_ms: recent,
+                event_kind: "tool_call".to_string(),
+                tool_name: Some("exec_command".to_string()),
+                call_id: Some("call_1".to_string()),
+                status: Some("completed".to_string()),
+                source: "response".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .insert_content_capture(&ContentCaptureRecord {
+                request_id: "req-expired-parent".to_string(),
+                observed_at_ms: recent,
+                direction: "response".to_string(),
+                source: "response".to_string(),
+                content_type: Some("application/json".to_string()),
+                preview_text: "{}".to_string(),
+                truncated: false,
+                redacted: false,
+            })
+            .await
+            .unwrap();
+
+        let deleted = store.purge_expired().await.unwrap();
+        assert_eq!(deleted, 4);
+        assert!(!request_exists(&store, "req-expired-parent").await.unwrap());
     }
 
     #[tokio::test]
