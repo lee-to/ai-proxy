@@ -884,6 +884,8 @@ make check      # type-check without building
 
 Unit tests cover all scanners and the redactor. Integration tests spin up mock upstream servers and verify end-to-end redaction, Codex routing, compressed request/response handling, SSE streaming, duplicate headers, and body size limits.
 
+The [redaction regression matrix](docs/redaction-regression.md) maps existing coverage and forwarding-boundary fixtures for reverse proxy, MITM and blind CONNECT. These local fixtures capture the bytes received by a fake upstream and exercise request chunk boundaries, compression errors, scanner failure policies and cancellation. Unsupported inspection and scanner failures remain distinct from successful scans; an HTTP success alone does not establish that inspection succeeded.
+
 ## Project Structure
 
 ```
@@ -902,6 +904,7 @@ src/
     structural_scanner.rs        # Layer 3: JWT, connection strings, .env
 tests/
   integration_test.rs            # end-to-end proxy tests
+  redaction_regression.rs         # mode-specific forwarding and failure fixtures
 config.toml                      # runtime configuration
 ```
 

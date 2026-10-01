@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::{
-    ScanMatch, SecretScanner, default_restore_policy_for_category, sensitivity_class_for_category,
+    ScanMatch, ScanReport, SecretScanner, default_restore_policy_for_category,
+    sensitivity_class_for_category,
 };
 use crate::config::ModelScannerConfig;
 
@@ -183,8 +184,12 @@ impl ModelScanner {
 
 impl SecretScanner for ModelScanner {
     fn scan(&self, text: &str) -> Vec<ScanMatch> {
+        self.scan_report(text).findings
+    }
+
+    fn scan_report(&self, text: &str) -> ScanReport {
         if text.is_empty() {
-            return Vec::new();
+            return ScanReport::default();
         }
 
         let scanner = self.clone();
@@ -205,7 +210,10 @@ impl SecretScanner for ModelScanner {
                     findings = findings.len(),
                     "Model scanner completed"
                 );
-                findings
+                ScanReport {
+                    findings,
+                    failed_scanners: Vec::new(),
+                }
             }
             Err(error) => {
                 warn!(
@@ -215,17 +223,22 @@ impl SecretScanner for ModelScanner {
                     fail_policy = %self.config.fail_policy,
                     "Model scanner failed"
                 );
-                if self.config.fail_policy == "fail_closed" && !fallback_text.is_empty() {
-                    vec![ScanMatch::new(
-                        fallback_text.clone(),
-                        "model",
-                        "generic_secret",
-                        0,
-                        fallback_text.len(),
-                        0.50,
-                    )]
-                } else {
-                    Vec::new()
+                let findings =
+                    if self.config.fail_policy == "fail_closed" && !fallback_text.is_empty() {
+                        vec![ScanMatch::new(
+                            fallback_text.clone(),
+                            "model",
+                            "generic_secret",
+                            0,
+                            fallback_text.len(),
+                            0.50,
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                ScanReport {
+                    findings,
+                    failed_scanners: vec![self.name().to_string()],
                 }
             }
         }

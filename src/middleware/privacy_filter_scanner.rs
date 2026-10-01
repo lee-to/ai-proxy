@@ -8,7 +8,8 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use super::{
-    ScanMatch, SecretScanner, default_restore_policy_for_category, sensitivity_class_for_category,
+    ScanMatch, ScanReport, SecretScanner, default_restore_policy_for_category,
+    sensitivity_class_for_category,
 };
 use crate::config::PrivacyFilterScannerConfig;
 
@@ -234,8 +235,12 @@ impl PrivacyFilterScanner {
 
 impl SecretScanner for PrivacyFilterScanner {
     fn scan(&self, text: &str) -> Vec<ScanMatch> {
+        self.scan_report(text).findings
+    }
+
+    fn scan_report(&self, text: &str) -> ScanReport {
         if text.is_empty() {
-            return Vec::new();
+            return ScanReport::default();
         }
 
         let scanner = self.clone();
@@ -255,7 +260,10 @@ impl SecretScanner for PrivacyFilterScanner {
                     findings = findings.len(),
                     "Privacy filter scanner completed"
                 );
-                findings
+                ScanReport {
+                    findings,
+                    failed_scanners: Vec::new(),
+                }
             }
             Err(error) => {
                 warn!(
@@ -263,17 +271,22 @@ impl SecretScanner for PrivacyFilterScanner {
                     fail_policy = %self.config.fail_policy,
                     "Privacy filter scanner failed"
                 );
-                if self.config.fail_policy == "fail_closed" && !fallback_text.is_empty() {
-                    vec![ScanMatch::new(
-                        fallback_text.clone(),
-                        "privacy_filter",
-                        "secret",
-                        0,
-                        fallback_text.len(),
-                        0.50,
-                    )]
-                } else {
-                    Vec::new()
+                let findings =
+                    if self.config.fail_policy == "fail_closed" && !fallback_text.is_empty() {
+                        vec![ScanMatch::new(
+                            fallback_text.clone(),
+                            "privacy_filter",
+                            "secret",
+                            0,
+                            fallback_text.len(),
+                            0.50,
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                ScanReport {
+                    findings,
+                    failed_scanners: vec![self.name().to_string()],
                 }
             }
         }
@@ -426,6 +439,9 @@ mod tests {
         }
         let mut config = config(String::new());
         config.command = command_path.to_string_lossy().to_string();
+        // Successful-process control: allow startup under parallel test load.
+        // Dedicated regression fixtures exercise the timeout failure policy.
+        config.timeout_ms = 5000;
         let scanner = PrivacyFilterScanner::new(&config);
 
         let findings = scanner
@@ -464,6 +480,8 @@ mod tests {
         let mut config = config(String::new());
         config.command = command_path.to_string_lossy().to_string();
         config.command_args = vec!["--device".to_string(), "cpu".to_string()];
+        // This test verifies arguments, not process startup latency.
+        config.timeout_ms = 5000;
         let scanner = PrivacyFilterScanner::new(&config);
 
         scanner
