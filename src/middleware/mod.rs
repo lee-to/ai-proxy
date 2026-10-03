@@ -114,8 +114,23 @@ pub trait SecretScanner: Send + Sync {
     /// Scan the given text and return all detected secret matches.
     fn scan(&self, text: &str) -> Vec<ScanMatch>;
 
+    /// Report inspection failures separately from an empty successful scan.
+    fn scan_report(&self, text: &str) -> ScanReport {
+        ScanReport {
+            findings: self.scan(text),
+            failed_scanners: Vec::new(),
+        }
+    }
+
     /// Scanner name for logging/identification.
     fn name(&self) -> &str;
+}
+
+#[derive(Debug, Default)]
+pub struct ScanReport {
+    pub findings: Vec<ScanMatch>,
+    /// Scanner names only; never contains inspected text or adapter responses.
+    pub failed_scanners: Vec<String>,
 }
 
 /// Pipeline that runs multiple scanners and deduplicates results.
@@ -142,6 +157,10 @@ impl ScanPipeline {
 
     /// Run all scanners on the text, deduplicating by exact span and resolving overlaps.
     pub fn scan(&self, text: &str) -> Vec<ScanMatch> {
+        self.scan_report(text).findings
+    }
+
+    pub fn scan_report(&self, text: &str) -> ScanReport {
         if let Ok(handle) = tokio::runtime::Handle::try_current()
             && matches!(
                 handle.runtime_flavor(),
@@ -153,7 +172,7 @@ impl ScanPipeline {
         self.scan_inner(text)
     }
 
-    fn scan_inner(&self, text: &str) -> Vec<ScanMatch> {
+    fn scan_inner(&self, text: &str) -> ScanReport {
         debug!(
             text_len = text.len(),
             scanner_count = self.scanners.len(),
@@ -162,9 +181,12 @@ impl ScanPipeline {
 
         let mut candidates: Vec<(usize, ScanMatch)> = Vec::new();
         let mut ordinal = 0;
+        let mut failed_scanners = Vec::new();
 
         for scanner in &self.scanners {
-            let matches = scanner.scan(text);
+            let report = scanner.scan_report(text);
+            failed_scanners.extend(report.failed_scanners);
+            let matches = report.findings;
             let mut totals: BTreeMap<String, usize> = BTreeMap::new();
             for m in &matches {
                 *totals.entry(m.category.clone()).or_default() += 1;
@@ -173,7 +195,7 @@ impl ScanPipeline {
                 scanner = scanner.name(),
                 matches_found = matches.len(),
                 category_totals = ?totals,
-                "Scanner completed"
+                "Scanner returned findings"
             );
 
             for m in matches {
@@ -195,12 +217,23 @@ impl ScanPipeline {
         for m in &results {
             *totals.entry(m.category.clone()).or_default() += 1;
         }
-        info!(
-            total_unique_matches = results.len(),
-            category_totals = ?totals,
-            "Scan pipeline completed"
-        );
-        results
+        if failed_scanners.is_empty() {
+            info!(
+                total_unique_matches = results.len(),
+                category_totals = ?totals,
+                "Scan pipeline completed"
+            );
+        } else {
+            warn!(
+                total_unique_matches = results.len(),
+                failed_scanners = ?failed_scanners,
+                "Scan pipeline used failure policy after incomplete inspection"
+            );
+        }
+        ScanReport {
+            findings: results,
+            failed_scanners,
+        }
     }
 }
 
@@ -292,6 +325,50 @@ fn spans_overlap(left_start: usize, left_end: usize, right_start: usize, right_e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailedScanner;
+
+    impl SecretScanner for FailedScanner {
+        fn scan(&self, _: &str) -> Vec<ScanMatch> {
+            Vec::new()
+        }
+
+        fn scan_report(&self, _: &str) -> ScanReport {
+            ScanReport {
+                findings: Vec::new(),
+                failed_scanners: vec![self.name().to_string()],
+            }
+        }
+
+        fn name(&self) -> &str {
+            "failed"
+        }
+    }
+
+    #[test]
+    fn preserves_failure_status_when_other_scanners_find_secrets() {
+        let mut pipeline = ScanPipeline::new();
+        pipeline.add_scanner(Box::new(regex_scanner::RegexScanner::new(
+            &crate::config::RegexScannerConfig {
+                enabled: true,
+                patterns: vec![crate::config::RegexPattern {
+                    name: "aws_access_key".to_string(),
+                    pattern: "AKIA[0-9A-Z]{16}".to_string(),
+                }],
+            },
+        )));
+        pipeline.add_scanner(Box::new(FailedScanner));
+
+        let clean = pipeline.scan_report("clean control");
+        assert!(clean.findings.is_empty());
+        assert_eq!(clean.failed_scanners, ["failed"]);
+
+        let secret = pipeline.scan_report("AKIA0000000000000000");
+        assert_eq!(secret.findings.len(), 1);
+        assert_eq!(secret.failed_scanners, ["failed"]);
+        // Existing callers can still request findings without a report.
+        assert_eq!(pipeline.scan("AKIA0000000000000000").len(), 1);
+    }
 
     #[test]
     fn normalizes_duplicate_and_overlapping_findings() {

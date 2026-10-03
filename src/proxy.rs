@@ -2002,10 +2002,19 @@ fn scan_and_redact(
     text: &str,
     context: &mut RedactionContext,
 ) -> crate::redactor::RedactionResult {
-    let matches = state.pipeline.scan(text);
+    let report = state.pipeline.scan_report(text);
+    let matches = report.findings;
 
     if matches.is_empty() {
-        debug!(request_id, "No sensitive data found");
+        if report.failed_scanners.is_empty() {
+            debug!(request_id, "No sensitive data found");
+        } else {
+            warn!(
+                request_id,
+                failed_scanners = ?report.failed_scanners,
+                "Forwarding without findings under scanner failure policy"
+            );
+        }
         return crate::redactor::RedactionResult {
             text: text.to_string(),
             findings: Vec::new(),
