@@ -241,7 +241,11 @@ A secret like `sk-ant-abcdef123456789xyz` becomes `sk-***...***xyz`. The entire 
 
 Set `strategy = "placeholder"` to send typed placeholders upstream instead of masked values. PII categories listed in `restorable_categories` can be restored in downstream HTTP responses when `response_restore_enabled = true`; `person_name` is not restorable by default and should only be added when restoring names to the client is safe for your deployment. Secret categories such as API keys, passwords, private keys, JWTs, and connection strings are not restored by default. Request-local placeholder maps are kept only for the active request/response and are not logged.
 
-SSE and chunked responses use a bounded rolling buffer so placeholders split across chunks, for example `[EMAIL_1]`, can still be restored without buffering the full stream. WebSocket MITM inspection currently redacts client-to-upstream text frames only; server-to-client WebSocket restoration is intentionally not enabled in this implementation.
+Chunked responses use a bounded rolling buffer so placeholders split across network chunks can
+still be restored. SSE restoration buffers one event at a time and escapes restored values in
+JSON data. Events larger than 1 MiB pass through unchanged. WebSocket MITM inspection currently
+redacts client-to-upstream text frames only; server-to-client WebSocket restoration is intentionally
+not enabled in this implementation.
 
 ### Scanner
 
@@ -250,6 +254,7 @@ SSE and chunked responses use a bounded rolling buffer so placeholders split acr
 enabled = true          # false disables all secret scanning and redaction
 scan_scope = "body"     # "body" = request body only, "full" = body + headers + query params
 uninspectable_body_policy = "forward"  # forward | reject
+request_scan_timeout_ms = 5000         # total budget for inspecting an HTTP request
 header_whitelist = [    # headers skipped during scanning (auth headers forwarded as-is)
     "x-api-key",
     "authorization",
@@ -259,9 +264,11 @@ header_whitelist = [    # headers skipped during scanning (auth headers forwarde
 ]
 ```
 
-The HTTP scanner processes JSON string values individually, preserving object keys, non-string
-values, and JSON structure. Optional model and privacy-filter scanners also receive individual
-string values for JSON requests. With scanning enabled, set `uninspectable_body_policy = "reject"` to
+The HTTP scanner checks each JSON string, including repeated object members. It rewrites only
+the string tokens that change, so numbers, whitespace, and object member order are preserved.
+Optional model and privacy-filter scanners receive individual string values and share the request's
+scan budget with the other scanners. The proxy returns HTTP 504 when the budget expires.
+With scanning enabled, set `uninspectable_body_policy = "reject"` to
 reject unsupported content encodings and non-UTF-8 bodies with HTTP 415, or bodies declared as
 JSON that fail to parse with HTTP 400. The default `forward` preserves compatibility with
 opaque and plain-text bodies. The policy applies to inspected HTTP requests.
@@ -482,6 +489,7 @@ AI_PROXY_ENTROPY_SCANNER_ENABLED=false
 AI_PROXY_STRUCTURAL_SCANNER_ENABLED=false
 AI_PROXY_SCAN_SCOPE=full
 AI_PROXY_UNINSPECTABLE_BODY_POLICY=forward
+AI_PROXY_REQUEST_SCAN_TIMEOUT_MS=5000
 AI_PROXY_REDACTION_STRATEGY=partial
 AI_PROXY_RESPONSE_RESTORE_ENABLED=false
 AI_PROXY_RESTORABLE_CATEGORIES=email,phone
@@ -617,7 +625,8 @@ Set `OPENAI_BASE_URL` so Codex/OpenAI Responses traffic goes through the proxy:
 export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 ```
 
-Reverse proxy requests to `/v1/responses` use `codex_upstream_url` by default. Clients can
+Reverse proxy requests to `/v1/responses` use `codex_upstream_url` by default, including
+paths with a gateway prefix. Clients can
 select subscription routing by using a subscription bearer token together with
 `ChatGPT-Account-Id` or by using that token on the explicit
 `/backend-api/codex/responses` path. On a forward proxy connection, subscription routing

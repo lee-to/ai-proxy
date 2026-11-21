@@ -42,6 +42,7 @@ restorable_categories = ["email", "phone"]       # add person_name only if respo
 enabled = false
 scan_scope = "body"
 uninspectable_body_policy = "forward"   # forward | reject
+request_scan_timeout_ms = 5000          # budget for scanning an HTTP request
 header_whitelist = [
     "x-api-key",
     "authorization",

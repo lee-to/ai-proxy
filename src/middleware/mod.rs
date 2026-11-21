@@ -5,6 +5,7 @@ pub mod regex_scanner;
 pub mod structural_scanner;
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 pub const RESTORE_POLICY_ALLOW: &str = "allow";
@@ -127,6 +128,20 @@ pub trait SecretScanner: Send + Sync {
         self.scan_report(text)
     }
 
+    /// Scan within the enclosing request budget. External scanners also pass
+    /// the deadline to their asynchronous work.
+    fn scan_before(
+        &self,
+        text: &str,
+        field: Option<&str>,
+        _deadline: Option<Instant>,
+    ) -> ScanReport {
+        match field {
+            Some(field) => self.scan_field(text, field),
+            None => self.scan_report(text),
+        }
+    }
+
     /// Scanner name for logging/identification.
     fn name(&self) -> &str;
 }
@@ -170,18 +185,27 @@ impl ScanPipeline {
     }
 
     pub fn scan_with_field(&self, text: &str, field: Option<&str>) -> ScanReport {
+        self.scan_before(text, field, None)
+    }
+
+    pub(crate) fn scan_before(
+        &self,
+        text: &str,
+        field: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> ScanReport {
         if let Ok(handle) = tokio::runtime::Handle::try_current()
             && matches!(
                 handle.runtime_flavor(),
                 tokio::runtime::RuntimeFlavor::MultiThread
             )
         {
-            return tokio::task::block_in_place(|| self.scan_inner(text, field));
+            return tokio::task::block_in_place(|| self.scan_inner(text, field, deadline));
         }
-        self.scan_inner(text, field)
+        self.scan_inner(text, field, deadline)
     }
 
-    fn scan_inner(&self, text: &str, field: Option<&str>) -> ScanReport {
+    fn scan_inner(&self, text: &str, field: Option<&str>, deadline: Option<Instant>) -> ScanReport {
         debug!(
             text_len = text.len(),
             scanner_count = self.scanners.len(),
@@ -193,10 +217,10 @@ impl ScanPipeline {
         let mut failed_scanners = Vec::new();
 
         for scanner in &self.scanners {
-            let report = match field {
-                Some(field) => scanner.scan_field(text, field),
-                None => scanner.scan_report(text),
-            };
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            let report = scanner.scan_before(text, field, deadline);
             failed_scanners.extend(report.failed_scanners);
             let matches = report.findings;
             let mut totals: BTreeMap<String, usize> = BTreeMap::new();

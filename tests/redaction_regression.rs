@@ -608,6 +608,64 @@ async fn redaction_captures_controls_and_canaries_across_request_chunks() {
 }
 
 #[tokio::test]
+async fn repeated_json_members_are_all_inspected_and_keep_wire_order() {
+    use ai_proxy::config::UninspectableBodyPolicy;
+
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::with_config(mode, None, |config| {
+            config.scanner.uninspectable_body_policy = UninspectableBodyPolicy::Reject;
+        })
+        .await;
+        let body = r#"{"messages":[{"content":"first","content":"second"}]}"#;
+        let response = fixture.request().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, body.as_bytes());
+        assert_eq!(fixture.observations().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn inspecting_json_strings_preserves_numeric_tokens() {
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::new(mode, None).await;
+        let body = format!(
+            r#"{{ "n": 18446744073709551617, "decimal": 0.123456789012345678901, "content": "{CANARY}" }}"#,
+        );
+        let expected = body.replace(CANARY, MASKED);
+        let response = fixture.request().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, expected.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn json_fields_share_one_request_scan_deadline() {
+    struct SlowScanner;
+
+    impl SecretScanner for SlowScanner {
+        fn scan(&self, _: &str) -> Vec<ScanMatch> {
+            std::thread::sleep(Duration::from_millis(60));
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "slow_fixture"
+        }
+    }
+
+    for mode in INSPECTING_MODES {
+        let fixture = Fixture::with_config(mode, Some(Box::new(SlowScanner)), |config| {
+            config.scanner.request_scan_timeout_ms = 150;
+        })
+        .await;
+        let body = r#"{"input":["one","two","three","four","five"]}"#;
+        let response = fixture.request().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(fixture.upstream_requests.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn http_json_scan_preserves_source_code_near_authority_identifiers() {
     use ai_proxy::middleware::entropy_scanner::EntropyScanner;
 

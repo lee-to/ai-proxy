@@ -843,6 +843,7 @@ async fn start_proxy_with_custom_client_redaction_and_telemetry(
             enabled: scanner_enabled,
             scan_scope: scan_scope.to_string(),
             uninspectable_body_policy: UninspectableBodyPolicy::Forward,
+            request_scan_timeout_ms: 5000,
             header_whitelist: vec!["authorization".to_string()],
             model: ModelScannerConfig::default(),
             privacy_filter: PrivacyFilterScannerConfig::default(),
@@ -1630,7 +1631,18 @@ async fn test_mitm_websocket_persists_codex_usage() {
             .contains("response.completed")
     );
 
-    let dashboard = telemetry_store.usage_dashboard(24).await.unwrap();
+    // Usage is recorded asynchronously from the WebSocket forwarding task.
+    let dashboard = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let dashboard = telemetry_store.usage_dashboard(24).await.unwrap();
+            if dashboard.totals.total_tokens != 0 {
+                break dashboard;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("WebSocket telemetry should be recorded");
     assert_eq!(dashboard.totals.input_tokens, 21);
     assert_eq!(dashboard.totals.output_tokens, 34);
     assert_eq!(dashboard.totals.total_tokens, 55);

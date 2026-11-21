@@ -223,6 +223,8 @@ pub struct ScannerConfig {
     pub scan_scope: String,
     #[serde(default)]
     pub uninspectable_body_policy: UninspectableBodyPolicy,
+    #[serde(default = "default_request_scan_timeout_ms")]
+    pub request_scan_timeout_ms: u64,
     pub header_whitelist: Vec<String>,
     #[serde(default)]
     pub model: ModelScannerConfig,
@@ -231,6 +233,10 @@ pub struct ScannerConfig {
     pub regex: RegexScannerConfig,
     pub entropy: EntropyScannerConfig,
     pub structural: StructuralScannerConfig,
+}
+
+fn default_request_scan_timeout_ms() -> u64 {
+    5000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -471,6 +477,10 @@ impl Config {
             &mut self.scanner.enabled,
         )?;
         override_string("AI_PROXY_SCAN_SCOPE", &mut self.scanner.scan_scope);
+        override_parse(
+            "AI_PROXY_REQUEST_SCAN_TIMEOUT_MS",
+            &mut self.scanner.request_scan_timeout_ms,
+        )?;
         if let Ok(policy) = env::var("AI_PROXY_UNINSPECTABLE_BODY_POLICY") {
             self.scanner.uninspectable_body_policy = match policy.as_str() {
                 "forward" => UninspectableBodyPolicy::Forward,
@@ -582,6 +592,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.scanner.request_scan_timeout_ms == 0 {
+            return Err(config_error(
+                "scanner.request_scan_timeout_ms must be greater than zero",
+            ));
+        }
         if self.proxy.rate_limit_enabled
             && (self.proxy.rate_limit_rps == 0 || self.proxy.rate_limit_rps > u32::MAX as u64)
         {
@@ -966,6 +981,7 @@ mod tests {
                 enabled: false,
                 scan_scope: "body".to_string(),
                 uninspectable_body_policy: UninspectableBodyPolicy::Forward,
+                request_scan_timeout_ms: default_request_scan_timeout_ms(),
                 header_whitelist: vec!["authorization".to_string()],
                 model: ModelScannerConfig::default(),
                 privacy_filter: PrivacyFilterScannerConfig::default(),

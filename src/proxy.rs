@@ -15,7 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::convert::Infallible;
 use std::error::Error;
 use std::io::Read;
@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 use url::{Url, form_urlencoded};
 
 use crate::config::{Config, ProxyConfig, UninspectableBodyPolicy};
+use crate::json_edit::{JsonEdits, ObjectMembers, WalkError, visit_strings};
 use crate::logging::log_redaction;
 use crate::middleware::ScanPipeline;
 use crate::mitm::{MitmAuthority, normalize_connect_host};
@@ -259,18 +260,57 @@ async fn forward_request(
         }
     };
 
-    let mut processed_body = match process_request_body(
-        state,
-        &request_id,
-        &headers,
-        &body_bytes,
-        allow_normalization,
-        force_codex_store_false,
-    )
-    .await
-    {
-        Ok(body) => body,
-        Err(status) => return Err(status),
+    let scan_deadline = tokio::time::Instant::now()
+        + Duration::from_millis(state.config.scanner.request_scan_timeout_ms);
+    let inspect = async {
+        let mut processed = process_request_body(
+            state,
+            &request_id,
+            &headers,
+            &body_bytes,
+            allow_normalization,
+            force_codex_store_false,
+            scan_deadline.into_std(),
+        )
+        .await?;
+
+        let (forwarded_headers, final_upstream_url) =
+            if state.config.scanner.enabled && state.config.scanner.scan_scope == "full" {
+                let scanned_headers = scan_and_redact_headers(
+                    state,
+                    &headers,
+                    &request_id,
+                    &mut processed.context,
+                    scan_deadline.into_std(),
+                )
+                .await;
+                let redacted_url = scan_and_redact_query_params(
+                    state,
+                    &upstream_url,
+                    &request_id,
+                    &mut processed.context,
+                    scan_deadline.into_std(),
+                )
+                .await;
+                (scanned_headers, redacted_url)
+            } else {
+                (headers.clone(), upstream_url.clone())
+            };
+        if state.config.scanner.enabled && tokio::time::Instant::now() >= scan_deadline {
+            warn!(request_id, "Request inspection exceeded its time budget");
+            return Err(StatusCode::GATEWAY_TIMEOUT);
+        }
+        Ok::<_, StatusCode>((processed, forwarded_headers, final_upstream_url))
+    };
+    let (processed_body, forwarded_headers, final_upstream_url) = if state.config.scanner.enabled {
+        tokio::time::timeout_at(scan_deadline, inspect)
+            .await
+            .map_err(|_| {
+                warn!(request_id, "Request inspection exceeded its time budget");
+                StatusCode::GATEWAY_TIMEOUT
+            })??
+    } else {
+        inspect.await?
     };
 
     let model = extract_model_from_json(&processed_body.telemetry_bytes);
@@ -315,23 +355,6 @@ async fn forward_request(
         forwarded_size = processed_body.bytes.len(),
         "Body processed"
     );
-
-    let (forwarded_headers, final_upstream_url) =
-        if state.config.scanner.enabled && state.config.scanner.scan_scope == "full" {
-            let scanned_headers =
-                scan_and_redact_headers(state, &headers, &request_id, &mut processed_body.context)
-                    .await;
-            let redacted_url = scan_and_redact_query_params(
-                state,
-                &upstream_url,
-                &request_id,
-                &mut processed_body.context,
-            )
-            .await;
-            (scanned_headers, redacted_url)
-        } else {
-            (headers.clone(), upstream_url)
-        };
 
     let reqwest_method = match reqwest_method(&method) {
         Ok(method) => method,
@@ -444,15 +467,15 @@ async fn response_from_upstream(
                 placeholder_count_empty = redaction_context.is_empty(),
                 "Response placeholder restoration enabled"
             );
-            let json_strings = response_content_type
-                .as_deref()
-                .map(media_type)
-                .is_some_and(|mime| is_json_media_type(&mime) || mime == "application/x-ndjson");
-            Box::pin(restore_response_stream(
-                stream,
-                redaction_context,
-                json_strings,
-            ))
+            let mime = response_content_type.as_deref().map(media_type);
+            let restore = match mime.as_deref() {
+                Some("text/event-stream") => StreamingRestore::for_sse(redaction_context),
+                Some(mime) if is_json_media_type(mime) || mime == "application/x-ndjson" => {
+                    StreamingRestore::with_json_strings(redaction_context, true)
+                }
+                _ => StreamingRestore::new(redaction_context),
+            };
+            Box::pin(restore_response_stream(stream, restore))
         } else {
             debug!(
                 request_id = %request_id,
@@ -517,15 +540,10 @@ fn response_restore_allowed(content_type: Option<&str>, content_encoding: Option
 
 fn restore_response_stream(
     stream: ResponseByteStream,
-    context: RedactionContext,
-    json_strings: bool,
+    restore: StreamingRestore,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     futures_util::stream::unfold(
-        (
-            stream,
-            Some(StreamingRestore::with_json_strings(context, json_strings)),
-            false,
-        ),
+        (stream, Some(restore), false),
         |(mut stream, mut restore, finished)| async move {
             if finished {
                 return None;
@@ -883,6 +901,7 @@ async fn persist_content_capture_from_text(
             request_id.to_string(),
             preview.to_string(),
             context,
+            None,
         )
         .await;
         result.text
@@ -1027,6 +1046,33 @@ fn preview_text(bytes: &[u8], max_bytes: usize) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_recognizes_prefixed_reverse_proxy_paths_only() {
+        assert_eq!(
+            codex_response_path("/gateway/v1/responses", true),
+            Some((false, ""))
+        );
+        assert_eq!(
+            codex_response_path("/gateway/v1/responses/compact", true),
+            Some((false, "/compact"))
+        );
+        assert_eq!(codex_response_path("/gateway/v1/responses", false), None);
+        assert_eq!(codex_response_path("/gateway/v1/responsesXYZ", true), None);
+    }
+
+    #[test]
+    fn subscription_normalization_keeps_untouched_json_tokens() {
+        let body = NormalizedBody {
+            bytes: Bytes::from_static(br#"{"n":18446744073709551617,"store":true,"stream":false}"#),
+            decoded: false,
+        };
+        let normalized = normalize_codex_subscription_payload(body);
+        assert_eq!(
+            normalized.bytes.as_ref(),
+            br#"{"n":18446744073709551617,"store":false,"stream":true}"#
+        );
+    }
 
     #[test]
     fn websocket_upgrade_requires_both_header_tokens() {
@@ -1743,6 +1789,7 @@ async fn redact_websocket_message(
                 request_id.to_string(),
                 text.to_string(),
                 context.clone(),
+                None,
             )
             .await;
             *context = updated_context;
@@ -1788,16 +1835,17 @@ fn upstream_route(
     headers: &HeaderMap,
     destination_host: Option<&str>,
 ) -> UpstreamRoute {
-    if !is_codex_responses_path(uri.path()) {
+    let Some((subscription_path, suffix)) =
+        codex_response_path(uri.path(), destination_host.is_none())
+    else {
         return UpstreamRoute {
             base_url: state.config.proxy.anthropic_upstream_url.clone(),
             absolute_url: None,
             is_codex_responses: false,
             needs_codex_subscription_payload_normalization: false,
         };
-    }
+    };
 
-    let subscription_path = path_matches(uri.path(), "/backend-api/codex/responses");
     let has_account = headers
         .get("chatgpt-account-id")
         .and_then(|value| value.to_str().ok())
@@ -1812,9 +1860,10 @@ fn upstream_route(
             absolute_url: Some(subscription_upstream_url(
                 state.config.proxy.codex_subscription_url.as_str(),
                 uri,
+                suffix,
             )),
             is_codex_responses: true,
-            needs_codex_subscription_payload_normalization: !is_codex_compact_path(uri.path()),
+            needs_codex_subscription_payload_normalization: suffix != "/compact",
         };
     }
 
@@ -1826,20 +1875,19 @@ fn upstream_route(
     }
 }
 
-fn is_codex_responses_path(path: &str) -> bool {
-    path_matches(path, "/v1/responses") || path_matches(path, "/backend-api/codex/responses")
-}
-
-fn path_matches(path: &str, prefix: &str) -> bool {
-    path.strip_prefix(prefix)
-        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-}
-
-fn is_codex_compact_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/responses/compact" | "/backend-api/codex/responses/compact"
-    )
+fn codex_response_path(path: &str, allow_prefix: bool) -> Option<(bool, &str)> {
+    [
+        ("/backend-api/codex/responses", true),
+        ("/v1/responses", false),
+    ]
+    .into_iter()
+    .find_map(|(endpoint, subscription)| {
+        path.match_indices(endpoint)
+            .filter(|(start, _)| allow_prefix || *start == 0)
+            .map(|(start, matched)| &path[start + matched.len()..])
+            .find(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+            .map(|suffix| (subscription, suffix))
+    })
 }
 
 fn has_subscription_bearer(headers: &HeaderMap) -> bool {
@@ -1891,19 +1939,9 @@ fn append_query(base_url: &str, uri: &Uri) -> String {
     }
 }
 
-fn subscription_upstream_url(base_url: &str, uri: &Uri) -> String {
-    const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
-    const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
-
-    let request_path = uri.path();
-    let suffix = request_path
-        .strip_prefix(CODEX_RESPONSES_PATH)
-        .or_else(|| request_path.strip_prefix(OPENAI_RESPONSES_PATH))
-        .unwrap_or("");
+fn subscription_upstream_url(base_url: &str, uri: &Uri, suffix: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    let with_suffix = format!("{base}{suffix}");
-
-    append_query(&with_suffix, uri)
+    append_query(&format!("{base}{suffix}"), uri)
 }
 
 struct ProcessedBody {
@@ -1920,6 +1958,7 @@ async fn process_request_body(
     body: &Bytes,
     allow_normalization: bool,
     force_codex_store_false: bool,
+    scan_deadline: std::time::Instant,
 ) -> Result<ProcessedBody, StatusCode> {
     let normalized = if allow_normalization {
         normalize_body(headers, body, state.config.proxy.max_body_size)?
@@ -1936,7 +1975,7 @@ async fn process_request_body(
         normalized
     };
     let telemetry_bytes = normalized.bytes.clone();
-    let context = RedactionContext::new(request_id, &state.config.redaction);
+    let mut context = RedactionContext::new(request_id, &state.config.redaction);
 
     if !state.config.scanner.enabled {
         return Ok(ProcessedBody {
@@ -1985,37 +2024,70 @@ async fn process_request_body(
         .is_some_and(|value| is_json_media_type(&media_type(value)));
     let looks_like_json = body_string.trim_start().starts_with(['{', '[']);
     if declared_json || looks_like_json {
-        match serde_json::from_str::<Value>(body_string) {
-            Ok(mut json) => {
-                let state = Arc::clone(state);
-                let request_id = request_id.to_string();
-                let (json, changed, context) = tokio::task::spawn_blocking(move || {
-                    let mut context = context;
-                    let changed =
-                        redact_json_strings(&state, &request_id, &mut json, &mut context, None);
-                    (json, changed, context)
-                })
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                let bytes = if changed {
-                    Bytes::from(
-                        serde_json::to_vec(&json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-                    )
+        let json_bytes = normalized.bytes.clone();
+        let json_state = Arc::clone(state);
+        let json_request_id = request_id.to_string();
+        let worker = tokio::task::spawn_blocking(move || {
+            let text = std::str::from_utf8(&json_bytes).expect("body checked for UTF-8");
+            let raw: &RawValue = serde_json::from_str(text)?;
+            let mut edits = JsonEdits::new(text);
+            let check_deadline = || {
+                if std::time::Instant::now() >= scan_deadline {
+                    Err(WalkError::Deadline)
                 } else {
-                    normalized.bytes
-                };
+                    Ok(())
+                }
+            };
+            visit_strings(
+                raw,
+                None,
+                0,
+                &mut |token, value, field| {
+                    if !value.is_empty() {
+                        let redacted = scan_and_redact(
+                            &json_state,
+                            &json_request_id,
+                            value,
+                            &mut context,
+                            field,
+                            Some(scan_deadline),
+                        );
+                        check_deadline()?;
+                        if redacted.text != value {
+                            edits.replace(token, &serde_json::to_string(&redacted.text)?);
+                        }
+                    }
+                    Ok(())
+                },
+                &check_deadline,
+            )?;
+            Ok::<_, WalkError>((edits.finish(), context))
+        });
+        match worker
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            Ok((edited, context)) => {
                 return Ok(ProcessedBody {
-                    bytes,
+                    bytes: edited.map(Bytes::from).unwrap_or(normalized.bytes),
                     telemetry_bytes,
                     strip_content_encoding: normalized.decoded,
                     context,
                 });
             }
-            Err(_) if declared_json && reject_uninspectable && !normalized.bytes.is_empty() => {
+            Err(WalkError::Deadline) => {
+                warn!(request_id, "Request inspection exceeded its time budget");
+                return Err(StatusCode::GATEWAY_TIMEOUT);
+            }
+            Err(WalkError::InvalidJson)
+                if declared_json && reject_uninspectable && !normalized.bytes.is_empty() =>
+            {
                 warn!("Rejecting malformed JSON request body");
                 return Err(StatusCode::BAD_REQUEST);
             }
-            Err(_) => {}
+            Err(WalkError::InvalidJson) => {
+                context = RedactionContext::new(request_id, &state.config.redaction);
+            }
         }
     }
 
@@ -2024,6 +2096,7 @@ async fn process_request_body(
         request_id.to_string(),
         body_string.to_string(),
         context,
+        Some(scan_deadline),
     )
     .await;
     Ok(ProcessedBody {
@@ -2035,41 +2108,58 @@ async fn process_request_body(
 }
 
 fn normalize_codex_subscription_payload(body: NormalizedBody) -> NormalizedBody {
-    let Ok(mut json) = serde_json::from_slice::<Value>(&body.bytes) else {
+    let Ok(text) = std::str::from_utf8(&body.bytes) else {
+        return body;
+    };
+    let Ok(ObjectMembers(members)) = serde_json::from_str::<ObjectMembers<'_>>(text) else {
         return body;
     };
 
-    let Some(object) = json.as_object_mut() else {
-        return body;
-    };
-
-    let store_was = object.get("store").cloned();
-    let stream_was = object.get("stream").cloned();
-    if store_was == Some(Value::Bool(false)) && stream_was == Some(Value::Bool(true)) {
-        return body;
+    let mut edits = JsonEdits::new(text);
+    let mut has_store = false;
+    let mut has_stream = false;
+    for (key, value) in &members {
+        let replacement = match key.as_str() {
+            "store" => {
+                has_store = true;
+                "false"
+            }
+            "stream" => {
+                has_stream = true;
+                "true"
+            }
+            _ => continue,
+        };
+        if value.get() != replacement {
+            edits.replace(value.get(), replacement);
+        }
     }
 
-    if store_was.is_some() || stream_was.is_some() {
-        warn!(
-            previous_store = ?store_was,
-            previous_stream = ?stream_was,
-            "Overriding Codex subscription request payload store/stream fields"
+    if !has_store || !has_stream {
+        let mut missing = Vec::new();
+        if !has_store {
+            missing.push(r#""store":false"#);
+        }
+        if !has_stream {
+            missing.push(r#""stream":true"#);
+        }
+        let separator = if members.is_empty() { "" } else { "," };
+        let end = text.trim_end().len() - 1;
+        edits.replace(
+            &text[end..end],
+            &format!("{separator}{}", missing.join(",")),
         );
     }
-    object.insert("store".to_string(), Value::Bool(false));
-    object.insert("stream".to_string(), Value::Bool(true));
-    match serde_json::to_vec(&json) {
-        Ok(bytes) => {
+
+    match edits.finish() {
+        Some(edited) => {
             info!("Normalized Codex subscription request payload");
             NormalizedBody {
-                bytes: Bytes::from(bytes),
+                bytes: Bytes::from(edited),
                 decoded: body.decoded,
             }
         }
-        Err(error) => {
-            warn!(error = %error, "Failed to serialize Codex subscription request body");
-            body
-        }
+        None => body,
     }
 }
 
@@ -2174,40 +2264,6 @@ fn decompress_zstd(body: &[u8], max_body_size: usize) -> Result<Bytes, StatusCod
     Ok(Bytes::from(decompressed))
 }
 
-fn redact_json_strings(
-    state: &AppState,
-    request_id: &str,
-    value: &mut Value,
-    context: &mut RedactionContext,
-    field: Option<&str>,
-) -> bool {
-    match value {
-        Value::String(text) if !text.is_empty() => {
-            let redacted = scan_and_redact(state, request_id, text, context, field);
-            if redacted.text == *text {
-                return false;
-            }
-            *text = redacted.text;
-            true
-        }
-        Value::Array(values) => {
-            let mut changed = false;
-            for value in values {
-                changed |= redact_json_strings(state, request_id, value, context, field);
-            }
-            changed
-        }
-        Value::Object(values) => {
-            let mut changed = false;
-            for (key, value) in values {
-                changed |= redact_json_strings(state, request_id, value, context, Some(key));
-            }
-            changed
-        }
-        _ => false,
-    }
-}
-
 /// Scan text for secrets and redact them.
 fn scan_and_redact(
     state: &AppState,
@@ -2215,8 +2271,9 @@ fn scan_and_redact(
     text: &str,
     context: &mut RedactionContext,
     field: Option<&str>,
+    deadline: Option<std::time::Instant>,
 ) -> crate::redactor::RedactionResult {
-    let report = state.pipeline.scan_with_field(text, field);
+    let report = state.pipeline.scan_before(text, field, deadline);
     let matches = report.findings;
 
     if matches.is_empty() {
@@ -2262,9 +2319,10 @@ async fn scan_and_redact_blocking(
     request_id: String,
     text: String,
     mut context: RedactionContext,
+    deadline: Option<std::time::Instant>,
 ) -> (crate::redactor::RedactionResult, RedactionContext) {
     tokio::task::spawn_blocking(move || {
-        let result = scan_and_redact(&state, &request_id, &text, &mut context, None);
+        let result = scan_and_redact(&state, &request_id, &text, &mut context, None, deadline);
         (result, context)
     })
     .await
@@ -2277,6 +2335,7 @@ async fn scan_and_redact_headers(
     headers: &HeaderMap,
     request_id: &str,
     context: &mut RedactionContext,
+    deadline: std::time::Instant,
 ) -> HeaderMap {
     let whitelist: Vec<String> = state
         .config
@@ -2302,6 +2361,7 @@ async fn scan_and_redact_headers(
                 request_id.to_string(),
                 val_str.to_string(),
                 context.clone(),
+                Some(deadline),
             )
             .await;
             *context = updated_context;
@@ -2333,6 +2393,7 @@ async fn scan_and_redact_query_params(
     url: &str,
     request_id: &str,
     context: &mut RedactionContext,
+    deadline: std::time::Instant,
 ) -> String {
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
@@ -2349,6 +2410,7 @@ async fn scan_and_redact_query_params(
             request_id.to_string(),
             value.to_string(),
             context.clone(),
+            Some(deadline),
         )
         .await;
         *context = updated_context;
