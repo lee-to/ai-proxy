@@ -42,7 +42,7 @@ use crate::redactor::Redactor;
 use crate::telemetry::{
     ContentCaptureRecord, RequestRecord, RequestTelemetryContext, ResponseTelemetryCollector,
     extract_model_from_json, extract_tool_events_from_json, extract_websocket_text_telemetry,
-    next_request_id, now_ms,
+    next_request_id, now_ms, telemetry_url,
 };
 use crate::telemetry_store::TelemetryStore;
 
@@ -99,7 +99,7 @@ pub async fn proxy_handler(
         request_id = %request_id,
         method = %method,
         path = %uri.path(),
-        upstream = %route.base_url,
+        upstream = %telemetry_url(&route.base_url),
         "Incoming request"
     );
 
@@ -222,13 +222,14 @@ async fn forward_request(
     };
 
     let model = extract_model_from_json(&processed_body.telemetry_bytes);
+    let telemetry_upstream = telemetry_url(&upstream_url).to_owned();
     let telemetry_context = RequestTelemetryContext {
         request_id: request_id.clone(),
         started_at_ms: now_ms(),
         method: method.to_string(),
-        path: upstream_url.clone(),
+        path: telemetry_upstream.clone(),
         mode: mode.to_string(),
-        upstream: upstream_url.clone(),
+        upstream: telemetry_upstream,
         model,
     };
     persist_request_start(state, &telemetry_context).await;
@@ -303,7 +304,7 @@ async fn forward_request(
     let upstream_resp = match upstream_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
-            error!(request_id = %request_id, mode, error = %e, "Failed to connect to upstream");
+            error!(request_id = %request_id, mode, error = %e.without_url(), "Failed to connect to upstream");
             persist_request_finish(
                 state,
                 &request_id,
@@ -371,8 +372,9 @@ async fn response_from_upstream(
     let stream = upstream_resp.bytes_stream().map(move |chunk| {
         let stream_request_id = stream_request_id.clone();
         chunk.map_err(move |e| {
-            warn!(request_id = %stream_request_id, mode, error = %e, "Error reading upstream response chunk");
-            std::io::Error::other(e)
+            let error = e.without_url();
+            warn!(request_id = %stream_request_id, mode, %error, "Error reading upstream response chunk");
+            std::io::Error::other(error)
         })
     });
     let stream: ResponseByteStream = Box::pin(stream);
@@ -1247,8 +1249,8 @@ async fn handle_mitm_http_request(
         mode = "mitm",
         request_id = %request_id,
         method = %method,
-        path = %path_and_query,
-        upstream = %upstream_url,
+        path = %uri.path(),
+        upstream = %telemetry_url(&upstream_url),
         "Forwarding decrypted CONNECT request"
     );
 
@@ -1313,10 +1315,11 @@ async fn handle_mitm_websocket_upgrade(
     };
 
     let ws_url = websocket_url_from_https(&upstream_url);
+    let telemetry_ws_url = telemetry_url(&ws_url);
     let upstream_request = match build_websocket_upstream_request(&ws_url, &headers) {
         Ok(request) => request,
         Err(error) => {
-            warn!(mode = "mitm", error = %error, upstream = %ws_url, "Failed to build upstream WebSocket request");
+            warn!(mode = "mitm", error = %error, upstream = %telemetry_ws_url, "Failed to build upstream WebSocket request");
             let mut response = Response::new(Body::from("bad websocket upstream request"));
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             return response;
@@ -1328,13 +1331,13 @@ async fn handle_mitm_websocket_upgrade(
             debug!(
                 mode = "mitm",
                 status = response.status().as_u16(),
-                upstream = %ws_url,
+                upstream = %telemetry_ws_url,
                 "Connected upstream WebSocket"
             );
             (websocket, response)
         }
         Err(error) => {
-            warn!(mode = "mitm", error = %error, upstream = %ws_url, "Failed to connect upstream WebSocket");
+            warn!(mode = "mitm", error = %error, upstream = %telemetry_ws_url, "Failed to connect upstream WebSocket");
             let mut response = Response::new(Body::from("websocket upstream unavailable"));
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             return response;
@@ -1407,7 +1410,7 @@ async fn proxy_mitm_websocket(
         mode = "mitm",
         request_id = %request_id,
         websocket_mode = %websocket_mode,
-        upstream = %upstream_url,
+        upstream = %telemetry_url(&upstream_url),
         "Starting WebSocket MITM session"
     );
     debug!(
@@ -1424,7 +1427,7 @@ async fn proxy_mitm_websocket(
         method: "WEBSOCKET".to_string(),
         path,
         mode: "mitm-websocket".to_string(),
-        upstream: upstream_url.clone(),
+        upstream: telemetry_url(&upstream_url).to_owned(),
         model: None,
     };
     persist_request_start(&state, &telemetry_context).await;
