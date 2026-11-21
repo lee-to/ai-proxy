@@ -1,6 +1,6 @@
 use tracing::{debug, trace};
 
-use super::{ScanMatch, SecretScanner};
+use super::{ScanMatch, ScanReport, SecretScanner};
 use crate::config::EntropyScannerConfig;
 
 /// Layer 2: Shannon entropy analysis with keyword proximity detection.
@@ -62,10 +62,25 @@ impl EntropyScanner {
                 .min(text.len()),
         );
         let search_area = text[search_start..search_end].to_lowercase();
+        let before_window = text[..search_start].chars().next_back();
+        let after_window = text[search_end..].chars().next();
 
         self.keywords
             .iter()
-            .any(|kw| search_area.contains(kw.as_str()))
+            .filter(|keyword| !keyword.is_empty())
+            .any(|keyword| {
+                search_area
+                    .match_indices(keyword.as_str())
+                    .any(|(start, word)| {
+                        let before = search_area[..start].chars().next_back().or(before_window);
+                        let after = search_area[start + word.len()..]
+                            .chars()
+                            .next()
+                            .or(after_window);
+                        !before.is_some_and(char::is_alphanumeric)
+                            && !after.is_some_and(char::is_alphanumeric)
+                    })
+            })
     }
 
     /// Extract candidate tokens from text — contiguous non-whitespace sequences
@@ -76,13 +91,10 @@ impl EntropyScanner {
 
         for (i, c) in text.char_indices() {
             if !c.is_whitespace()
-                && c != '"'
-                && c != '\''
-                && c != ','
-                && c != '{'
-                && c != '}'
-                && c != '['
-                && c != ']'
+                && !matches!(
+                    c,
+                    '"' | '\'' | '`' | ',' | '{' | '}' | '[' | ']' | '(' | ')' | ';'
+                )
             {
                 if start.is_none() {
                     start = Some(i);
@@ -122,10 +134,17 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-impl SecretScanner for EntropyScanner {
-    fn scan(&self, text: &str) -> Vec<ScanMatch> {
+impl EntropyScanner {
+    fn scan_candidates(&self, text: &str, field: Option<&str>) -> Vec<ScanMatch> {
         let mut matches = Vec::new();
         let candidates = self.extract_candidates(text);
+        let sensitive_field = field.is_some_and(|name| {
+            let name = name.to_lowercase();
+            self.keywords.iter().any(|keyword| {
+                name.split(|c: char| !c.is_alphanumeric())
+                    .any(|part| part == keyword)
+            })
+        });
 
         trace!(
             candidate_count = candidates.len(),
@@ -135,7 +154,10 @@ impl SecretScanner for EntropyScanner {
         for (pos, token) in candidates {
             let entropy = Self::shannon_entropy(token);
 
-            if entropy >= self.threshold && self.keyword_nearby(text, pos, token.len()) {
+            if entropy >= self.threshold
+                && ((sensitive_field && pos <= self.keyword_proximity)
+                    || self.keyword_nearby(text, pos, token.len()))
+            {
                 trace!(
                     token_start = pos,
                     token_len = token.len(),
@@ -155,6 +177,19 @@ impl SecretScanner for EntropyScanner {
 
         debug!(matches_found = matches.len(), "Entropy scan completed");
         matches
+    }
+}
+
+impl SecretScanner for EntropyScanner {
+    fn scan(&self, text: &str) -> Vec<ScanMatch> {
+        self.scan_candidates(text, None)
+    }
+
+    fn scan_field(&self, text: &str, field: &str) -> ScanReport {
+        ScanReport {
+            findings: self.scan_candidates(text, Some(field)),
+            failed_scanners: Vec::new(),
+        }
     }
 
     fn name(&self) -> &str {
@@ -224,6 +259,13 @@ mod tests {
             matches.is_empty(),
             "Should not match without nearby keyword"
         );
+        assert_eq!(
+            scanner
+                .scan_field("aB3xZ9mK2pL5nR8vQ4wE7jF1hG6", "api_key")
+                .findings
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -240,6 +282,18 @@ mod tests {
         let text = "token = abc123";
         let matches = scanner.scan(text);
         assert!(matches.is_empty(), "Short tokens should be ignored");
+    }
+
+    #[test]
+    fn keyword_must_be_complete_even_at_the_edge_of_the_search_window() {
+        let mut config = test_config();
+        config.keywords = vec!["auth".to_string()];
+        config.keyword_proximity = 5;
+        let scanner = EntropyScanner::new(&config);
+        let candidate = "aB3xZ9mK2pL5nR8vQ4wE7jF1hG6";
+        assert_eq!(scanner.scan(&format!("auth {candidate}")).len(), 1);
+        assert!(scanner.scan(&format!("{candidate} authority")).is_empty());
+        assert!(scanner.scan(&format!("oauth {candidate}")).is_empty());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dashboard;
+mod json_edit;
 pub mod logging;
 pub mod middleware;
 pub mod mitm;

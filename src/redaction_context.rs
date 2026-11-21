@@ -115,6 +115,10 @@ impl RedactionContext {
     }
 
     pub fn restore_bytes(&self, bytes: Bytes) -> RestoreReport {
+        self.restore_bytes_with_format(bytes, false)
+    }
+
+    fn restore_bytes_with_format(&self, bytes: Bytes, json_strings: bool) -> RestoreReport {
         if !self.response_restore_enabled || self.entries.is_empty() {
             trace!(
                 request_id = %self.request_id,
@@ -139,7 +143,7 @@ impl RedactionContext {
             };
         };
 
-        let (restored, counts_by_category) = self.restore_text(text);
+        let (restored, counts_by_category) = self.restore_text_with_format(text, json_strings);
         RestoreReport {
             bytes: Bytes::from(restored),
             counts_by_category,
@@ -147,6 +151,14 @@ impl RedactionContext {
     }
 
     pub fn restore_text(&self, text: &str) -> (String, BTreeMap<String, usize>) {
+        self.restore_text_with_format(text, false)
+    }
+
+    fn restore_text_with_format(
+        &self,
+        text: &str,
+        json_strings: bool,
+    ) -> (String, BTreeMap<String, usize>) {
         let mut restored = String::with_capacity(text.len());
         let mut counts_by_category = BTreeMap::new();
         let replacements: Vec<_> = self
@@ -176,7 +188,13 @@ impl RedactionContext {
                 continue;
             };
 
-            restored.push_str(&entry.original);
+            if json_strings {
+                let encoded = serde_json::to_string(&entry.original)
+                    .expect("serializing a JSON string cannot fail");
+                restored.push_str(&encoded[1..encoded.len() - 1]);
+            } else {
+                restored.push_str(&entry.original);
+            }
             *counts_by_category
                 .entry(entry.category.clone())
                 .or_default() += 1;
@@ -199,10 +217,16 @@ fn percent_encode_placeholder(placeholder: &str) -> String {
 pub struct StreamingRestore {
     context: RedactionContext,
     pending: Vec<u8>,
+    json_strings: bool,
+    sse: Option<SseBuffer>,
 }
 
 impl StreamingRestore {
     pub fn new(context: RedactionContext) -> Self {
+        Self::with_json_strings(context, false)
+    }
+
+    pub fn with_json_strings(context: RedactionContext, json_strings: bool) -> Self {
         debug!(
             request_id = %context.request_id(),
             max_placeholder_len = context.max_placeholder_len(),
@@ -211,10 +235,21 @@ impl StreamingRestore {
         Self {
             context,
             pending: Vec::new(),
+            json_strings,
+            sse: None,
         }
     }
 
+    pub(crate) fn for_sse(context: RedactionContext) -> Self {
+        let mut restore = Self::new(context);
+        restore.sse = Some(SseBuffer::default());
+        restore
+    }
+
     pub fn push(&mut self, chunk: Bytes) -> RestoreReport {
+        if let Some(sse) = &mut self.sse {
+            return sse.push(&self.context, &chunk);
+        }
         self.pending.extend_from_slice(&chunk);
         let keep_len = self.longest_placeholder_prefix_suffix();
         if keep_len == self.pending.len() {
@@ -244,7 +279,9 @@ impl StreamingRestore {
             };
         }
         let emit = self.pending.drain(..emit_len).collect::<Vec<_>>();
-        let report = self.context.restore_bytes(Bytes::from(emit));
+        let report = self
+            .context
+            .restore_bytes_with_format(Bytes::from(emit), self.json_strings);
         trace!(
             request_id = %self.context.request_id(),
             emitted_len = report.bytes.len(),
@@ -256,12 +293,18 @@ impl StreamingRestore {
     }
 
     pub fn finish(mut self) -> Option<RestoreReport> {
+        if let Some(sse) = self.sse {
+            return (!sse.event.is_empty()).then(|| restore_sse_event(&self.context, sse.event));
+        }
         if self.pending.is_empty() {
             return None;
         }
 
         let pending = std::mem::take(&mut self.pending);
-        Some(self.context.restore_bytes(Bytes::from(pending)))
+        Some(
+            self.context
+                .restore_bytes_with_format(Bytes::from(pending), self.json_strings),
+        )
     }
 
     fn longest_placeholder_prefix_suffix(&self) -> usize {
@@ -284,6 +327,116 @@ impl StreamingRestore {
             }
         }
         0
+    }
+}
+
+#[derive(Default)]
+struct SseBuffer {
+    event: Vec<u8>,
+    line_has_text: bool,
+    pending_cr: bool,
+    passthrough: bool,
+}
+
+impl SseBuffer {
+    fn push(&mut self, context: &RedactionContext, chunk: &[u8]) -> RestoreReport {
+        const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+        let mut output = Vec::new();
+        let mut counts = BTreeMap::new();
+        for &byte in chunk {
+            if std::mem::take(&mut self.pending_cr) && byte != b'\n' {
+                self.end_line(context, &mut output, &mut counts);
+            }
+            if self.event.len() == MAX_EVENT_BYTES {
+                // Preserve oversized events unchanged while keeping memory bounded.
+                output.append(&mut self.event);
+                self.passthrough = true;
+            }
+            if self.passthrough {
+                output.push(byte);
+            } else {
+                self.event.push(byte);
+            }
+            match byte {
+                b'\r' => self.pending_cr = true,
+                b'\n' => self.end_line(context, &mut output, &mut counts),
+                _ => self.line_has_text = true,
+            }
+        }
+        RestoreReport {
+            bytes: Bytes::from(output),
+            counts_by_category: counts,
+        }
+    }
+
+    fn end_line(
+        &mut self,
+        context: &RedactionContext,
+        output: &mut Vec<u8>,
+        counts: &mut BTreeMap<String, usize>,
+    ) {
+        if std::mem::take(&mut self.line_has_text) {
+            return;
+        }
+        self.passthrough = false;
+        let report = restore_sse_event(context, std::mem::take(&mut self.event));
+        output.extend_from_slice(&report.bytes);
+        for (category, count) in report.counts_by_category {
+            *counts.entry(category).or_default() += count;
+        }
+    }
+}
+
+fn sse_data_line(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.strip_prefix("data:")?;
+    let content = rest.strip_prefix(' ').unwrap_or(rest);
+    let text = content.trim_end_matches(['\r', '\n']);
+    let prefix_len = line.len() - content.len();
+    Some((&line[..prefix_len], text, &content[text.len()..]))
+}
+
+fn restore_sse_event(context: &RedactionContext, event: Vec<u8>) -> RestoreReport {
+    let mut counts = BTreeMap::new();
+    let Ok(text) = std::str::from_utf8(&event) else {
+        return RestoreReport {
+            bytes: Bytes::from(event),
+            counts_by_category: counts,
+        };
+    };
+    // The event payload is the concatenation of all data lines, regardless of
+    // whether an event arrived in one network chunk or many.
+    let lines = || text.split_inclusive(['\r', '\n']);
+    let data = lines()
+        .filter_map(|line| sse_data_line(line).map(|(_, data, _)| data))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let is_json = serde_json::from_str::<&serde_json::value::RawValue>(&data).is_ok();
+
+    let mut output = String::with_capacity(event.len());
+    for line in lines() {
+        let Some((prefix, data, ending)) = sse_data_line(line) else {
+            output.push_str(line);
+            continue;
+        };
+        let (restored, replacements) = context.restore_text_with_format(data, is_json);
+        output.push_str(prefix);
+        if !is_json && !replacements.is_empty() {
+            // Keep a newline in a restored plain-text value inside the data
+            // payload by spelling it as another data field.
+            let restored = restored.replace("\r\n", "\n").replace('\r', "\n");
+            output.push_str(&restored.replace('\n', "\ndata: "));
+        } else {
+            output.push_str(&restored);
+        }
+        output.push_str(ending);
+        for (category, count) in replacements {
+            *counts.entry(category).or_default() += count;
+        }
+    }
+    RestoreReport {
+        bytes: Bytes::from(output),
+        counts_by_category: counts,
     }
 }
 
@@ -384,6 +537,37 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&combined).unwrap(),
             "hello ada@example.com done"
+        );
+    }
+
+    #[test]
+    fn sse_restores_json_and_plain_text_without_breaking_framing() {
+        let mut context = RedactionContext::new("req-sse", &placeholder_config());
+        let name = "Ada \"A\" \\ Lovelace\nLondon";
+        let finding = ScanMatch::new(name.into(), "model", "person_name", 0, name.len(), 0.95);
+        let placeholder = context.placeholder_for(&finding);
+        let input = format!(
+            "event: delta\r\ndata: {{\r\ndata: \"text\":\"{placeholder}\"\r\ndata: }}\r\n\r\ndata: Hello {placeholder}\n\n"
+        );
+        let mut stream = StreamingRestore::for_sse(context);
+        let mut output = Vec::new();
+        // Exercise boundaries inside JSON, CRLF, and the placeholder.
+        for chunk in input.as_bytes().chunks(5) {
+            output.extend_from_slice(&stream.push(Bytes::copy_from_slice(chunk)).bytes);
+        }
+        assert!(stream.finish().is_none());
+        let output = String::from_utf8(output).unwrap();
+        let (json_event, plain_event) = output.split_once("\r\n\r\n").unwrap();
+        let data = json_event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(payload["text"], name);
+        assert_eq!(
+            plain_event,
+            "data: Hello Ada \"A\" \\ Lovelace\ndata: London\n\n"
         );
     }
 

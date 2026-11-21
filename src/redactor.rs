@@ -51,9 +51,10 @@ impl Redactor {
     /// For short strings: full mask replacement.
     pub fn redact(&self, value: &str) -> String {
         let char_count = value.chars().count();
-        let min_visible = self.prefix_len + self.suffix_len;
+        let visible = self.prefix_len.saturating_add(self.suffix_len);
+        let hidden = char_count.saturating_sub(visible);
 
-        if char_count <= min_visible + 2 {
+        if hidden <= 2 || hidden < visible {
             trace!(
                 original_len = value.len(),
                 "Secret too short for partial mask, using full mask"
@@ -63,12 +64,7 @@ impl Redactor {
             // Use char boundaries to avoid panics on multi-byte UTF-8
             let prefix: String = value.chars().take(self.prefix_len).collect();
             let suffix: String = value.chars().skip(char_count - self.suffix_len).collect();
-            trace!(
-                original_len = value.len(),
-                prefix = %prefix,
-                suffix = %suffix,
-                "Applying partial mask"
-            );
+            trace!(original_len = value.len(), "Applying partial mask");
             format!("{}{}{}", prefix, self.mask, suffix)
         }
     }
@@ -76,11 +72,7 @@ impl Redactor {
     /// Replace all occurrences of `secret` in `text` with its redacted form.
     pub fn redact_in_text(&self, text: &str, secret: &str) -> String {
         let masked = self.redact(secret);
-        debug!(
-            secret_len = secret.len(),
-            masked = %masked,
-            "Redacting secret in text"
-        );
+        debug!(secret_len = secret.len(), "Redacting secret in text");
         text.replace(secret, &masked)
     }
 
@@ -246,9 +238,9 @@ mod tests {
     #[test]
     fn test_partial_mask_boundary() {
         let r = test_redactor();
-        // 9 chars = prefix(3) + suffix(3) + 3 > min_visible + 2, partial mask
-        let result = r.redact("123456789");
-        assert_eq!(result, "123***...***789");
+        assert_eq!(r.redact("123456789"), "***...***");
+        assert_eq!(r.redact("12345678901"), "***...***");
+        assert_eq!(r.redact("123456789012"), "123***...***012");
     }
 
     #[test]

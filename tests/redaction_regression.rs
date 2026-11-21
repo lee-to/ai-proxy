@@ -6,7 +6,7 @@ use ai_proxy::{
         privacy_filter_scanner::PrivacyFilterScanner, regex_scanner::RegexScanner,
     },
     mitm::MitmAuthority,
-    proxy::{AppState, proxy_handler},
+    proxy::{AppState, ProxyRateLimits, proxy_handler},
     redactor::Redactor,
 };
 use axum::{
@@ -253,6 +253,14 @@ struct CapturedRequest {
 
 impl Fixture {
     async fn new(mode: Mode, extra_scanner: Option<Box<dyn SecretScanner>>) -> Self {
+        Self::with_config(mode, extra_scanner, |_| {}).await
+    }
+
+    async fn with_config(
+        mode: Mode,
+        extra_scanner: Option<Box<dyn SecretScanner>>,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let session = SessionObserver::new(upstream_addr.to_string());
@@ -356,6 +364,7 @@ impl Fixture {
         config.redaction.prefix_len = 3;
         config.redaction.suffix_len = 3;
         config.redaction.mask = "***...***".to_string();
+        configure(&mut config);
 
         let (scan_sender, scans) = mpsc::unbounded_channel();
         let mut pipeline = ScanPipeline::new();
@@ -371,6 +380,7 @@ impl Fixture {
         }
         let state = Arc::new(AppState {
             redactor: Redactor::new(&config.redaction),
+            rate_limits: ProxyRateLimits::new(&config.proxy),
             config,
             pipeline,
             http_client: reqwest::Client::builder()
@@ -598,6 +608,95 @@ async fn redaction_captures_controls_and_canaries_across_request_chunks() {
 }
 
 #[tokio::test]
+async fn repeated_json_members_are_all_inspected_and_keep_wire_order() {
+    use ai_proxy::config::UninspectableBodyPolicy;
+
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::with_config(mode, None, |config| {
+            config.scanner.uninspectable_body_policy = UninspectableBodyPolicy::Reject;
+        })
+        .await;
+        let body = r#"{"messages":[{"content":"first","content":"second"}]}"#;
+        let response = fixture.request().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, body.as_bytes());
+        assert_eq!(fixture.observations().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn inspecting_json_strings_preserves_numeric_tokens() {
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::new(mode, None).await;
+        let body = format!(
+            r#"{{ "n": 18446744073709551617, "decimal": 0.123456789012345678901, "content": "{CANARY}" }}"#,
+        );
+        let expected = body.replace(CANARY, MASKED);
+        let response = fixture.request().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, expected.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn json_fields_share_one_request_scan_deadline() {
+    struct SlowScanner;
+
+    impl SecretScanner for SlowScanner {
+        fn scan(&self, _: &str) -> Vec<ScanMatch> {
+            std::thread::sleep(Duration::from_millis(60));
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "slow_fixture"
+        }
+    }
+
+    for mode in INSPECTING_MODES {
+        let fixture = Fixture::with_config(mode, Some(Box::new(SlowScanner)), |config| {
+            config.scanner.request_scan_timeout_ms = 150;
+        })
+        .await;
+        let body = r#"{"input":["one","two","three","four","five"]}"#;
+        let response = fixture.request().body(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(fixture.upstream_requests.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn http_json_scan_preserves_source_code_near_authority_identifiers() {
+    use ai_proxy::middleware::entropy_scanner::EntropyScanner;
+
+    let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    let source = "let authority = request.uri().authority();\nreturn http::StatusCode::BAD_REQUEST.as_u16();";
+    let body = serde_json::json!({"messages":[{"role":"user","content":source}]}).to_string();
+    for mode in INSPECTING_MODES {
+        let entropy = Box::new(EntropyScanner::new(&config.scanner.entropy));
+        let mut fixture = Fixture::new(mode, Some(entropy)).await;
+        let response = fixture.request().body(body.clone()).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, body.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn http_body_limit_returns_payload_too_large_in_both_proxy_modes() {
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::new(mode, None).await;
+        let response = fixture
+            .request()
+            .body(vec![b'a'; 1025])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        fixture.assert_not_inspected_or_forwarded();
+    }
+}
+
+#[tokio::test]
 async fn redaction_rejects_corrupt_compression_without_contacting_upstream() {
     for mode in INSPECTING_MODES {
         for (encoding, body) in [
@@ -648,6 +747,65 @@ async fn redaction_distinguishes_opaque_bodies_from_successful_inspection() {
                 "opaque content must not be scanned"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn strict_inspection_accepts_plain_json_and_reports_unsupported_formats() {
+    use ai_proxy::config::UninspectableBodyPolicy;
+
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::with_config(mode, None, |config| {
+            config.scanner.uninspectable_body_policy = UninspectableBodyPolicy::Reject;
+        })
+        .await;
+        for (encoding, body, expected) in [
+            (
+                "br",
+                b"example payload".as_slice(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            ("identity", b"{", StatusCode::BAD_REQUEST),
+        ] {
+            let response = fixture
+                .request()
+                .header("content-encoding", encoding)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            fixture.assert_not_inspected_or_forwarded();
+        }
+        let body = r#"{"messages":[{"content":"Hello"}]}"#;
+        let response = fixture
+            .request()
+            .header("content-encoding", "Identity")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, body.as_bytes());
+        assert_eq!(fixture.observations().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn request_budget_counts_http_requests_in_both_proxy_modes() {
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::with_config(mode, None, |config| {
+            config.proxy.rate_limit_enabled = true;
+            config.proxy.rate_limit_rps = 1;
+        })
+        .await;
+        let first = fixture.request().send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        first.bytes().await.unwrap();
+        let second = fixture.request().send().await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(fixture.upstream_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.capture().await, b"");
     }
 }
 

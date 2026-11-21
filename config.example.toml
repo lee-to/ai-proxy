@@ -8,7 +8,7 @@ rate_limit_enabled = true
 max_body_size = 10485760       # 10 MB
 connect_timeout_secs = 10
 request_timeout_secs = 0       # 0 disables total request timeout for streaming/SSE
-rate_limit_rps = 50
+rate_limit_rps = 50             # separate budgets for HTTP requests and new CONNECT tunnels
 mitm_enabled = true
 mitm_ca_cert_path = "certs/ai-proxy-ca.pem"       # auto-created with key on first MITM start
 mitm_ca_key_path = "certs/ai-proxy-ca-key.pem"    # private key; keep local and do not trust/install
@@ -41,6 +41,8 @@ restorable_categories = ["email", "phone"]       # add person_name only if respo
 [scanner]
 enabled = false
 scan_scope = "body"
+uninspectable_body_policy = "forward"   # forward | reject
+request_scan_timeout_ms = 5000          # budget for scanning an HTTP request
 header_whitelist = [
     "x-api-key",
     "authorization",
@@ -110,11 +112,11 @@ pattern = "gh[pousr]_[A-Za-z0-9_]{36,}"
 
 [[scanner.regex.patterns]]
 name = "anthropic_api_key"
-pattern = "sk-ant-[A-Za-z0-9-]{20,}"
+pattern = "sk-ant-[A-Za-z0-9_-]{20,}"
 
 [[scanner.regex.patterns]]
 name = "openai_api_key"
-pattern = "sk-[A-Za-z0-9]{20,}"
+pattern = "sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})"
 
 [[scanner.regex.patterns]]
 name = "email"
