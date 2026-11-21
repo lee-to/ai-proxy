@@ -1,16 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::{
-    Router,
-    extract::Request,
-    http::StatusCode,
-    middleware::{self, Next},
-    response::Response,
-    routing::any,
-};
-use governor::{Quota, RateLimiter};
-use std::num::NonZeroU32;
+use axum::{Router, routing::any};
 use tracing::info;
 
 use ai_proxy::config::Config;
@@ -22,30 +13,9 @@ use ai_proxy::middleware::privacy_filter_scanner::PrivacyFilterScanner;
 use ai_proxy::middleware::regex_scanner::RegexScanner;
 use ai_proxy::middleware::structural_scanner::StructuralScanner;
 use ai_proxy::mitm::MitmAuthority;
-use ai_proxy::proxy::{AppState, proxy_handler};
+use ai_proxy::proxy::{AppState, ProxyRateLimits, proxy_handler};
 use ai_proxy::redactor::Redactor;
 use ai_proxy::telemetry_store::TelemetryStore;
-
-type GlobalRateLimiter = Arc<
-    RateLimiter<
-        governor::state::NotKeyed,
-        governor::state::InMemoryState,
-        governor::clock::DefaultClock,
-    >,
->;
-
-async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let limiter = request
-        .extensions()
-        .get::<GlobalRateLimiter>()
-        .cloned()
-        .expect("rate limiter not in extensions");
-
-    if limiter.check().is_err() {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-    Ok(next.run(request).await)
-}
 
 #[tokio::main]
 async fn main() {
@@ -153,6 +123,7 @@ async fn main() {
     // Create shared state
     let state = Arc::new(AppState {
         config: config.clone(),
+        rate_limits: ProxyRateLimits::new(&config.proxy),
         pipeline,
         redactor,
         http_client,
@@ -169,21 +140,10 @@ async fn main() {
         });
     }
 
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/{*path}", any(proxy_handler))
         .fallback(any(proxy_handler))
         .with_state(state);
-
-    if config.proxy.rate_limit_enabled {
-        let quota = Quota::per_second(
-            NonZeroU32::new(config.proxy.rate_limit_rps as u32)
-                .expect("rate_limit_rps is validated during config load"),
-        );
-        let rate_limiter: GlobalRateLimiter = Arc::new(RateLimiter::direct(quota));
-        app = app
-            .layer(middleware::from_fn(rate_limit_middleware))
-            .layer(axum::Extension(rate_limiter));
-    }
 
     let listen_addr = &config.proxy.listen_addr;
     info!(listen_addr = %listen_addr, "Starting AI proxy server");

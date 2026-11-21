@@ -2,12 +2,13 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures_util::Stream;
 use futures_util::{SinkExt, StreamExt};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -16,6 +17,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::io::Read;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,9 +33,9 @@ use tokio_tungstenite::{
     },
 };
 use tracing::{debug, error, info, warn};
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 
-use crate::config::Config;
+use crate::config::{Config, ProxyConfig, UninspectableBodyPolicy};
 use crate::logging::log_redaction;
 use crate::middleware::ScanPipeline;
 use crate::mitm::{MitmAuthority, normalize_connect_host};
@@ -49,11 +51,45 @@ use crate::telemetry_store::TelemetryStore;
 /// Shared application state passed to the proxy handler.
 pub struct AppState {
     pub config: Config,
+    pub rate_limits: ProxyRateLimits,
     pub pipeline: ScanPipeline,
     pub redactor: Redactor,
     pub http_client: reqwest::Client,
     pub mitm_authority: Option<Arc<MitmAuthority>>,
     pub telemetry_store: Option<Arc<TelemetryStore>>,
+}
+
+pub struct ProxyRateLimits {
+    requests: Option<DefaultDirectRateLimiter>,
+    connects: Option<DefaultDirectRateLimiter>,
+}
+
+impl ProxyRateLimits {
+    pub fn new(config: &ProxyConfig) -> Self {
+        let new_limiter = || {
+            config.rate_limit_enabled.then(|| {
+                let rate = u32::try_from(config.rate_limit_rps)
+                    .ok()
+                    .and_then(NonZeroU32::new)
+                    .expect("rate_limit_rps is validated during config load");
+                RateLimiter::direct(Quota::per_second(rate))
+            })
+        };
+        Self {
+            requests: new_limiter(),
+            connects: new_limiter(),
+        }
+    }
+
+    fn check(limiter: &Option<DefaultDirectRateLimiter>) -> Result<(), StatusCode> {
+        if limiter
+            .as_ref()
+            .is_some_and(|limiter| limiter.check().is_err())
+        {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        Ok(())
+    }
 }
 
 /// Headers that are not safe to forward unchanged through this proxy.
@@ -93,13 +129,13 @@ pub async fn proxy_handler(
         return handle_connect(state, req).await;
     }
 
-    let route = upstream_route(&state, &uri, &headers);
+    let route = upstream_route(&state, &uri, &headers, uri.host());
 
     info!(
         request_id = %request_id,
         method = %method,
         path = %uri.path(),
-        upstream = %route.base_url,
+        upstream = %telemetry_url(&route.base_url),
         "Incoming request"
     );
 
@@ -124,6 +160,7 @@ pub async fn proxy_handler(
 }
 
 async fn handle_connect(state: Arc<AppState>, req: Request<Body>) -> Result<Response, StatusCode> {
+    ProxyRateLimits::check(&state.rate_limits.connects)?;
     let Some(authority) = req
         .uri()
         .authority()
@@ -199,6 +236,7 @@ async fn forward_request(
     mode: &'static str,
     request_id: String,
 ) -> Result<Response, StatusCode> {
+    ProxyRateLimits::check(&state.rate_limits.requests)?;
     let body_bytes = match axum::body::to_bytes(body, state.config.proxy.max_body_size).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -222,13 +260,16 @@ async fn forward_request(
     };
 
     let model = extract_model_from_json(&processed_body.telemetry_bytes);
+    let safe_upstream_url = telemetry_url(&upstream_url);
     let telemetry_context = RequestTelemetryContext {
         request_id: request_id.clone(),
         started_at_ms: now_ms(),
         method: method.to_string(),
-        path: upstream_url.clone(),
+        path: Url::parse(&safe_upstream_url)
+            .map(|url| url.path().to_string())
+            .unwrap_or_default(),
         mode: mode.to_string(),
-        upstream: upstream_url.clone(),
+        upstream: safe_upstream_url,
         model,
     };
     persist_request_start(state, &telemetry_context).await;
@@ -303,7 +344,7 @@ async fn forward_request(
     let upstream_resp = match upstream_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
-            error!(request_id = %request_id, mode, error = %e, "Failed to connect to upstream");
+            error!(request_id = %request_id, mode, error = %e.without_url(), "Failed to connect to upstream");
             persist_request_finish(
                 state,
                 &request_id,
@@ -371,8 +412,9 @@ async fn response_from_upstream(
     let stream = upstream_resp.bytes_stream().map(move |chunk| {
         let stream_request_id = stream_request_id.clone();
         chunk.map_err(move |e| {
-            warn!(request_id = %stream_request_id, mode, error = %e, "Error reading upstream response chunk");
-            std::io::Error::other(e)
+            let error = e.without_url();
+            warn!(request_id = %stream_request_id, mode, error = %error, "Error reading upstream response chunk");
+            std::io::Error::other(error)
         })
     });
     let stream: ResponseByteStream = Box::pin(stream);
@@ -388,7 +430,15 @@ async fn response_from_upstream(
                 placeholder_count_empty = redaction_context.is_empty(),
                 "Response placeholder restoration enabled"
             );
-            Box::pin(restore_response_stream(stream, redaction_context))
+            let json_strings = response_content_type
+                .as_deref()
+                .map(media_type)
+                .is_some_and(|mime| is_json_media_type(&mime) || mime == "application/x-ndjson");
+            Box::pin(restore_response_stream(
+                stream,
+                redaction_context,
+                json_strings,
+            ))
         } else {
             debug!(
                 request_id = %request_id,
@@ -454,9 +504,14 @@ fn response_restore_allowed(content_type: Option<&str>, content_encoding: Option
 fn restore_response_stream(
     stream: ResponseByteStream,
     context: RedactionContext,
+    json_strings: bool,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     futures_util::stream::unfold(
-        (stream, Some(StreamingRestore::new(context)), false),
+        (
+            stream,
+            Some(StreamingRestore::with_json_strings(context, json_strings)),
+            false,
+        ),
         |(mut stream, mut restore, finished)| async move {
             if finished {
                 return None;
@@ -1234,12 +1289,16 @@ async fn handle_mitm_http_request(
         .map(|value| value.as_str())
         .unwrap_or("/");
 
-    let route = upstream_route(&state, &uri, &headers);
+    let authority_host = normalize_connect_host(&authority).ok();
+    let route = upstream_route(&state, &uri, &headers, authority_host.as_deref());
     let upstream_url = route
         .absolute_url
         .unwrap_or_else(|| format!("https://{}{}", authority, path_and_query));
 
     if is_websocket_upgrade(&headers) {
+        if let Err(status) = ProxyRateLimits::check(&state.rate_limits.requests) {
+            return status.into_response();
+        }
         return handle_mitm_websocket_upgrade(state, req, upstream_url).await;
     }
 
@@ -1247,8 +1306,8 @@ async fn handle_mitm_http_request(
         mode = "mitm",
         request_id = %request_id,
         method = %method,
-        path = %path_and_query,
-        upstream = %upstream_url,
+        path = %uri.path(),
+        upstream = %telemetry_url(&upstream_url),
         "Forwarding decrypted CONNECT request"
     );
 
@@ -1313,10 +1372,11 @@ async fn handle_mitm_websocket_upgrade(
     };
 
     let ws_url = websocket_url_from_https(&upstream_url);
+    let safe_ws_url = telemetry_url(&ws_url);
     let upstream_request = match build_websocket_upstream_request(&ws_url, &headers) {
         Ok(request) => request,
-        Err(error) => {
-            warn!(mode = "mitm", error = %error, upstream = %ws_url, "Failed to build upstream WebSocket request");
+        Err(_) => {
+            warn!(mode = "mitm", upstream = %safe_ws_url, "Failed to build upstream WebSocket request");
             let mut response = Response::new(Body::from("bad websocket upstream request"));
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             return response;
@@ -1328,13 +1388,13 @@ async fn handle_mitm_websocket_upgrade(
             debug!(
                 mode = "mitm",
                 status = response.status().as_u16(),
-                upstream = %ws_url,
+                upstream = %safe_ws_url,
                 "Connected upstream WebSocket"
             );
             (websocket, response)
         }
-        Err(error) => {
-            warn!(mode = "mitm", error = %error, upstream = %ws_url, "Failed to connect upstream WebSocket");
+        Err(_) => {
+            warn!(mode = "mitm", upstream = %safe_ws_url, "Failed to connect upstream WebSocket");
             let mut response = Response::new(Body::from("websocket upstream unavailable"));
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             return response;
@@ -1344,6 +1404,7 @@ async fn handle_mitm_websocket_upgrade(
     let on_upgrade = hyper::upgrade::on(req);
     let state_for_task = state.clone();
     let websocket_mode_owned = websocket_mode.to_string();
+    let safe_upstream_url = telemetry_url(&upstream_url);
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -1353,7 +1414,7 @@ async fn handle_mitm_websocket_upgrade(
                     upstream_ws,
                     websocket_mode_owned,
                     request_id,
-                    upstream_url,
+                    safe_upstream_url,
                     path,
                 )
                 .await
@@ -1685,10 +1746,14 @@ struct UpstreamRoute {
     needs_codex_subscription_payload_normalization: bool,
 }
 
-/// Pick the upstream by endpoint shape. Anthropic-compatible traffic remains on
-/// proxy.anthropic_upstream_url; Codex/OpenAI Responses traffic goes to OpenAI or the
-/// ChatGPT subscription backend, matching the harness proxy behavior.
-fn upstream_route(state: &AppState, uri: &Uri, headers: &HeaderMap) -> UpstreamRoute {
+/// Reverse proxy clients select the subscription backend explicitly. For forward
+/// proxy requests, only a ChatGPT destination can select subscription routing.
+fn upstream_route(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    destination_host: Option<&str>,
+) -> UpstreamRoute {
     if !is_codex_responses_path(uri.path()) {
         return UpstreamRoute {
             base_url: state.config.proxy.anthropic_upstream_url.clone(),
@@ -1698,9 +1763,16 @@ fn upstream_route(state: &AppState, uri: &Uri, headers: &HeaderMap) -> UpstreamR
         };
     }
 
-    if state.config.proxy.codex_subscription_routing_enabled
-        && !is_openai_api_key_auth(headers.get("authorization").and_then(|v| v.to_str().ok()))
-    {
+    let subscription_path = path_matches(uri.path(), "/backend-api/codex/responses");
+    let has_account = headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    let subscription_route = match destination_host {
+        Some(host) => host.eq_ignore_ascii_case("chatgpt.com") && subscription_path,
+        None => has_subscription_bearer(headers) && (subscription_path || has_account),
+    };
+    if state.config.proxy.codex_subscription_routing_enabled && subscription_route {
         return UpstreamRoute {
             base_url: state.config.proxy.codex_subscription_url.clone(),
             absolute_url: Some(subscription_upstream_url(
@@ -1721,21 +1793,31 @@ fn upstream_route(state: &AppState, uri: &Uri, headers: &HeaderMap) -> UpstreamR
 }
 
 fn is_codex_responses_path(path: &str) -> bool {
-    path == "/v1/responses"
-        || path.ends_with("/v1/responses")
-        || path.contains("/v1/responses/")
-        || path.contains("/backend-api/codex/responses")
+    path_matches(path, "/v1/responses") || path_matches(path, "/backend-api/codex/responses")
+}
+
+fn path_matches(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
 fn is_codex_compact_path(path: &str) -> bool {
-    path == "/v1/responses/compact"
-        || path.ends_with("/v1/responses/compact")
-        || path == "/backend-api/codex/responses/compact"
-        || path.ends_with("/backend-api/codex/responses/compact")
+    matches!(
+        path,
+        "/v1/responses/compact" | "/backend-api/codex/responses/compact"
+    )
 }
 
-fn is_openai_api_key_auth(auth: Option<&str>) -> bool {
-    auth.is_some_and(|value| value.starts_with("Bearer sk-"))
+fn has_subscription_bearer(headers: &HeaderMap) -> bool {
+    let Some((scheme, token)) = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+    else {
+        return false;
+    };
+    let token = token.trim();
+    scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !token.starts_with("sk-")
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -1836,8 +1918,15 @@ async fn process_request_body(
         });
     }
 
-    let has_content_encoding = headers.get(CONTENT_ENCODING).is_some();
-    if has_content_encoding && !normalized.decoded {
+    let reject_uninspectable =
+        state.config.scanner.uninspectable_body_policy == UninspectableBodyPolicy::Reject;
+    let identity_encoding = request_encoding(headers)
+        .is_some_and(|value| value.is_empty() || value.eq_ignore_ascii_case("identity"));
+    if !normalized.decoded && !identity_encoding {
+        if reject_uninspectable {
+            warn!("Rejecting request body with unsupported content encoding");
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
         warn!("Skipping secret scan because request body content-encoding could not be decoded");
         return Ok(ProcessedBody {
             bytes: normalized.bytes,
@@ -1848,6 +1937,10 @@ async fn process_request_body(
     }
 
     let Ok(body_string) = std::str::from_utf8(&normalized.bytes) else {
+        if reject_uninspectable {
+            warn!("Rejecting non-UTF-8 request body");
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
         warn!("Skipping secret scan for non-UTF-8 request body");
         return Ok(ProcessedBody {
             bytes: normalized.bytes,
@@ -1856,6 +1949,46 @@ async fn process_request_body(
             context,
         });
     };
+
+    let declared_json = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| is_json_media_type(&media_type(value)));
+    let looks_like_json = body_string.trim_start().starts_with(['{', '[']);
+    if declared_json || looks_like_json {
+        match serde_json::from_str::<Value>(body_string) {
+            Ok(mut json) => {
+                let state = Arc::clone(state);
+                let request_id = request_id.to_string();
+                let (json, changed, context) = tokio::task::spawn_blocking(move || {
+                    let mut context = context;
+                    let changed =
+                        redact_json_strings(&state, &request_id, &mut json, &mut context, None);
+                    (json, changed, context)
+                })
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let bytes = if changed {
+                    Bytes::from(
+                        serde_json::to_vec(&json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                    )
+                } else {
+                    normalized.bytes
+                };
+                return Ok(ProcessedBody {
+                    bytes,
+                    telemetry_bytes,
+                    strip_content_encoding: normalized.decoded,
+                    context,
+                });
+            }
+            Err(_) if declared_json && reject_uninspectable && !normalized.bytes.is_empty() => {
+                warn!("Rejecting malformed JSON request body");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Err(_) => {}
+        }
+    }
 
     let (redacted_body, context) = scan_and_redact_blocking(
         state.clone(),
@@ -1916,25 +2049,42 @@ struct NormalizedBody {
     decoded: bool,
 }
 
+fn media_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_json_media_type(mime: &str) -> bool {
+    mime == "application/json" || mime.ends_with("+json")
+}
+
+fn request_encoding(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(CONTENT_ENCODING).iter();
+    let Some(value) = values.next() else {
+        return Some("");
+    };
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().map(str::trim)
+}
+
 fn normalize_body(
     headers: &HeaderMap,
     body: &Bytes,
     max_body_size: usize,
 ) -> Result<NormalizedBody, StatusCode> {
-    let Some(encoding) = headers
-        .get(CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase())
-    else {
-        return Ok(NormalizedBody {
-            bytes: body.clone(),
-            decoded: false,
-        });
-    };
-
-    let decoded = match encoding.as_str() {
-        "gzip" => Some(decompress_gzip(body, max_body_size)?),
-        "zstd" => Some(decompress_zstd(body, max_body_size)?),
+    let decoded = match request_encoding(headers) {
+        Some(encoding) if encoding.eq_ignore_ascii_case("gzip") => {
+            Some(decompress_gzip(body, max_body_size)?)
+        }
+        Some(encoding) if encoding.eq_ignore_ascii_case("zstd") => {
+            Some(decompress_zstd(body, max_body_size)?)
+        }
         _ => None,
     };
 
@@ -1995,14 +2145,49 @@ fn decompress_zstd(body: &[u8], max_body_size: usize) -> Result<Bytes, StatusCod
     Ok(Bytes::from(decompressed))
 }
 
+fn redact_json_strings(
+    state: &AppState,
+    request_id: &str,
+    value: &mut Value,
+    context: &mut RedactionContext,
+    field: Option<&str>,
+) -> bool {
+    match value {
+        Value::String(text) if !text.is_empty() => {
+            let redacted = scan_and_redact(state, request_id, text, context, field);
+            if redacted.text == *text {
+                return false;
+            }
+            *text = redacted.text;
+            true
+        }
+        Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= redact_json_strings(state, request_id, value, context, field);
+            }
+            changed
+        }
+        Value::Object(values) => {
+            let mut changed = false;
+            for (key, value) in values {
+                changed |= redact_json_strings(state, request_id, value, context, Some(key));
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 /// Scan text for secrets and redact them.
 fn scan_and_redact(
     state: &AppState,
     request_id: &str,
     text: &str,
     context: &mut RedactionContext,
+    field: Option<&str>,
 ) -> crate::redactor::RedactionResult {
-    let report = state.pipeline.scan_report(text);
+    let report = state.pipeline.scan_with_field(text, field);
     let matches = report.findings;
 
     if matches.is_empty() {
@@ -2050,7 +2235,7 @@ async fn scan_and_redact_blocking(
     mut context: RedactionContext,
 ) -> (crate::redactor::RedactionResult, RedactionContext) {
     tokio::task::spawn_blocking(move || {
-        let result = scan_and_redact(&state, &request_id, &text, &mut context);
+        let result = scan_and_redact(&state, &request_id, &text, &mut context, None);
         (result, context)
     })
     .await
@@ -2160,6 +2345,18 @@ fn percent_decode_query_component(value: &str) -> String {
         .next()
         .map(|(value, _)| value.into_owned())
         .unwrap_or_default()
+}
+
+/// Keep connection metadata separate from query parameters and credentials.
+fn telemetry_url(url: &str) -> String {
+    let Ok(mut url) = Url::parse(url) else {
+        return String::new();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.into()
 }
 
 /// Build the full upstream URL from base URL and request URI.

@@ -211,7 +211,7 @@ rate_limit_enabled = true
 max_body_size = 10485760              # max request body size (bytes), default 10 MB
 connect_timeout_secs = 10             # upstream connect timeout
 request_timeout_secs = 0              # total request timeout; 0 disables it for streaming/SSE
-rate_limit_rps = 50                   # max requests per second
+rate_limit_rps = 50                   # per-second budget for requests and a separate budget for CONNECT
 mitm_enabled = false                  # opt-in HTTPS CONNECT inspection
 mitm_ca_cert_path = "certs/ai-proxy-ca.pem"
 mitm_ca_key_path = "certs/ai-proxy-ca-key.pem"
@@ -220,6 +220,10 @@ mitm_excluded_hosts = []              # hostnames that should keep blind CONNECT
 mitm_included_hosts = []              # optional allowlist for MITM; empty means inspect all non-excluded hosts
 websocket_mode = "inspect"            # reject | passthrough | inspect; default inspect
 ```
+
+The HTTP request budget is shared across reverse proxy requests, HTTP requests inside inspected
+HTTPS connections, and WebSocket upgrades inside those connections. A separate budget limits new
+CONNECT tunnels. Requests inside a blind tunnel are opaque to the proxy.
 
 ### Redaction
 
@@ -245,6 +249,7 @@ SSE and chunked responses use a bounded rolling buffer so placeholders split acr
 [scanner]
 enabled = true          # false disables all secret scanning and redaction
 scan_scope = "body"     # "body" = request body only, "full" = body + headers + query params
+uninspectable_body_policy = "forward"  # forward | reject
 header_whitelist = [    # headers skipped during scanning (auth headers forwarded as-is)
     "x-api-key",
     "authorization",
@@ -253,6 +258,13 @@ header_whitelist = [    # headers skipped during scanning (auth headers forwarde
     "anthropic-beta",
 ]
 ```
+
+The HTTP scanner processes JSON string values individually, preserving object keys, non-string
+values, and JSON structure. Optional model and privacy-filter scanners also receive individual
+string values for JSON requests. With scanning enabled, set `uninspectable_body_policy = "reject"` to
+reject unsupported content encodings and non-UTF-8 bodies with HTTP 415, or bodies declared as
+JSON that fail to parse with HTTP 400. The default `forward` preserves compatibility with
+opaque and plain-text bodies. The policy applies to inspected HTTP requests.
 
 ### Local Model Scanner
 
@@ -455,6 +467,7 @@ ssh user@server 'sudo cat /etc/ai-proxy/dashboard.token'
 ```
 
 The dashboard stores the rolling last 24 hours of proxy telemetry in SQLite by default. It records request metadata, token usage reported by upstream responses, and tool-call/tool-result markers visible in proxied JSON or SSE payloads. It does not record local shell or filesystem actions that never pass through the model API, and server logs must not include raw prompts, auth headers, cookies, tool arguments, or tool output bodies.
+New URL metadata omits query strings, fragments, and URL credentials.
 
 Prompt and response previews are opt-in through `[dashboard.capture]`. With `redact_before_store = true`, the proxy scans/redacts a copy of the preview before writing it to SQLite and fails configuration if no scanners are configured. This does not require `[scanner].enabled = true`; that flag controls live traffic redaction and can break strict transports such as Codex WebSockets. Keep `[scanner].enabled = false` when you only want dashboard capture, but keep the scanner sub-sections such as `[scanner.regex]`, `[scanner.entropy]`, and `[scanner.structural]` configured so capture redaction has detectors to use. Set `prompts` or `responses` only on trusted machines and keep `max_body_bytes` small. HTML response bodies are omitted from previews and replaced with a short summary so Cloudflare/error pages do not fill the dashboard or SQLite database.
 
@@ -468,6 +481,7 @@ AI_PROXY_REGEX_SCANNER_ENABLED=false
 AI_PROXY_ENTROPY_SCANNER_ENABLED=false
 AI_PROXY_STRUCTURAL_SCANNER_ENABLED=false
 AI_PROXY_SCAN_SCOPE=full
+AI_PROXY_UNINSPECTABLE_BODY_POLICY=forward
 AI_PROXY_REDACTION_STRATEGY=partial
 AI_PROXY_RESPONSE_RESTORE_ENABLED=false
 AI_PROXY_RESTORABLE_CATEGORIES=email,phone
@@ -603,7 +617,12 @@ Set `OPENAI_BASE_URL` so Codex/OpenAI Responses traffic goes through the proxy:
 export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 ```
 
-Requests matching `/v1/responses` are forwarded by auth type. `Bearer sk-...` API keys go to `codex_upstream_url`. Other bearer tokens are treated as Codex subscription tokens and, by default, are routed to `codex_subscription_url`. Set `codex_subscription_routing_enabled = false` only if you intentionally use opaque bearer tokens with an OpenAI-compatible provider.
+Reverse proxy requests to `/v1/responses` use `codex_upstream_url` by default. Clients can
+select subscription routing by using a subscription bearer token together with
+`ChatGPT-Account-Id` or by using that token on the explicit
+`/backend-api/codex/responses` path. On a forward proxy connection, subscription routing
+matches the explicit ChatGPT destination and Codex backend path. Set
+`codex_subscription_routing_enabled = false` to disable these routing rules.
 
 For Codex subscription traffic, `chatgpt.com/backend-api/codex/responses` is stricter than the public Responses API. The proxy normalizes JSON request bodies on the base `/responses` route to `store: false` and `stream: true`. It also preserves suffixes such as `/compact`, so remote compaction requests continue to hit `/backend-api/codex/responses/compact`; compact payloads are forwarded without adding `store` or `stream`.
 

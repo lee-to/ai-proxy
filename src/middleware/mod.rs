@@ -122,6 +122,11 @@ pub trait SecretScanner: Send + Sync {
         }
     }
 
+    /// Inspect a decoded JSON string with its field name as optional context.
+    fn scan_field(&self, text: &str, _field: &str) -> ScanReport {
+        self.scan_report(text)
+    }
+
     /// Scanner name for logging/identification.
     fn name(&self) -> &str;
 }
@@ -161,18 +166,22 @@ impl ScanPipeline {
     }
 
     pub fn scan_report(&self, text: &str) -> ScanReport {
+        self.scan_with_field(text, None)
+    }
+
+    pub fn scan_with_field(&self, text: &str, field: Option<&str>) -> ScanReport {
         if let Ok(handle) = tokio::runtime::Handle::try_current()
             && matches!(
                 handle.runtime_flavor(),
                 tokio::runtime::RuntimeFlavor::MultiThread
             )
         {
-            return tokio::task::block_in_place(|| self.scan_inner(text));
+            return tokio::task::block_in_place(|| self.scan_inner(text, field));
         }
-        self.scan_inner(text)
+        self.scan_inner(text, field)
     }
 
-    fn scan_inner(&self, text: &str) -> ScanReport {
+    fn scan_inner(&self, text: &str, field: Option<&str>) -> ScanReport {
         debug!(
             text_len = text.len(),
             scanner_count = self.scanners.len(),
@@ -184,7 +193,10 @@ impl ScanPipeline {
         let mut failed_scanners = Vec::new();
 
         for scanner in &self.scanners {
-            let report = scanner.scan_report(text);
+            let report = match field {
+                Some(field) => scanner.scan_field(text, field),
+                None => scanner.scan_report(text),
+            };
             failed_scanners.extend(report.failed_scanners);
             let matches = report.findings;
             let mut totals: BTreeMap<String, usize> = BTreeMap::new();

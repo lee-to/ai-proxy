@@ -1,6 +1,6 @@
 use tracing::{debug, trace};
 
-use super::{ScanMatch, SecretScanner};
+use super::{ScanMatch, ScanReport, SecretScanner};
 use crate::config::EntropyScannerConfig;
 
 /// Layer 2: Shannon entropy analysis with keyword proximity detection.
@@ -122,10 +122,17 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-impl SecretScanner for EntropyScanner {
-    fn scan(&self, text: &str) -> Vec<ScanMatch> {
+impl EntropyScanner {
+    fn scan_candidates(&self, text: &str, field: Option<&str>) -> Vec<ScanMatch> {
         let mut matches = Vec::new();
         let candidates = self.extract_candidates(text);
+        let sensitive_field = field.is_some_and(|name| {
+            let name = name.to_lowercase();
+            self.keywords.iter().any(|keyword| {
+                name.split(|c: char| !c.is_alphanumeric())
+                    .any(|part| part == keyword)
+            })
+        });
 
         trace!(
             candidate_count = candidates.len(),
@@ -135,7 +142,10 @@ impl SecretScanner for EntropyScanner {
         for (pos, token) in candidates {
             let entropy = Self::shannon_entropy(token);
 
-            if entropy >= self.threshold && self.keyword_nearby(text, pos, token.len()) {
+            if entropy >= self.threshold
+                && ((sensitive_field && pos <= self.keyword_proximity)
+                    || self.keyword_nearby(text, pos, token.len()))
+            {
                 trace!(
                     token_start = pos,
                     token_len = token.len(),
@@ -155,6 +165,19 @@ impl SecretScanner for EntropyScanner {
 
         debug!(matches_found = matches.len(), "Entropy scan completed");
         matches
+    }
+}
+
+impl SecretScanner for EntropyScanner {
+    fn scan(&self, text: &str) -> Vec<ScanMatch> {
+        self.scan_candidates(text, None)
+    }
+
+    fn scan_field(&self, text: &str, field: &str) -> ScanReport {
+        ScanReport {
+            findings: self.scan_candidates(text, Some(field)),
+            failed_scanners: Vec::new(),
+        }
     }
 
     fn name(&self) -> &str {
@@ -223,6 +246,13 @@ mod tests {
         assert!(
             matches.is_empty(),
             "Should not match without nearby keyword"
+        );
+        assert_eq!(
+            scanner
+                .scan_field("aB3xZ9mK2pL5nR8vQ4wE7jF1hG6", "api_key")
+                .findings
+                .len(),
+            1
         );
     }
 
