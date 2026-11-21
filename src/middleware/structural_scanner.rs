@@ -33,7 +33,7 @@ impl StructuralScanner {
             ).expect("jwt regex"),
             // Connection strings: protocol://user:pass@host or key=value pairs with password
             connection_string_regex: Regex::new(
-                r"(?i)(?:mongodb|postgres(?:ql)?|mysql|redis|amqp|mssql)://[^\s]{10,}"
+                r#"(?i)(?:mongodb|postgres(?:ql)?|mysql|redis|amqp|mssql)://[^\s"'\x60\\]{10,}"#
             ).expect("connection string regex"),
             // .env style: KEY=value where KEY looks like a secret variable name
             env_pattern_regex: Regex::new(
@@ -165,6 +165,14 @@ mod tests {
                 .iter()
                 .any(|m| m.pattern_name == "connection_string")
         );
+    }
+
+    #[test]
+    fn connection_string_match_preserves_surrounding_quotes() {
+        let scanner = StructuralScanner::new(&full_config());
+        let matches = scanner.scan(r#"let url = "postgresql://localhost/catalog";"#);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].value, "postgresql://localhost/catalog");
     }
 
     #[test]

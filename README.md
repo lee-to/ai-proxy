@@ -237,7 +237,7 @@ response_restore_enabled = false
 restorable_categories = ["email", "phone"]
 ```
 
-A secret like `sk-ant-abcdef123456789xyz` becomes `sk-***...***xyz`. Secrets shorter than `prefix_len + suffix_len + 2` characters are fully masked.
+A secret like `sk-ant-abcdef123456789xyz` becomes `sk-***...***xyz`. The entire value is masked when partial masking would hide less than half its characters or leave only two characters hidden.
 
 Set `strategy = "placeholder"` to send typed placeholders upstream instead of masked values. PII categories listed in `restorable_categories` can be restored in downstream HTTP responses when `response_restore_enabled = true`; `person_name` is not restorable by default and should only be added when restoring names to the client is safe for your deployment. Secret categories such as API keys, passwords, private keys, JWTs, and connection strings are not restored by default. Request-local placeholder maps are kept only for the active request/response and are not logged.
 
@@ -563,7 +563,7 @@ keywords = ["key", "secret", "token", "password", "passwd", "credential", "auth"
 keyword_proximity = 50   # max distance (bytes) from keyword to flag a token
 ```
 
-High-entropy strings are only flagged when a secret-related keyword appears nearby.
+High-entropy strings are only flagged when a complete secret-related keyword appears nearby or in the JSON field name. For example, `auth` matches a word in `auth_token` and skips `authority`.
 
 #### Layer 3: Structural Detection
 

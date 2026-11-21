@@ -62,10 +62,25 @@ impl EntropyScanner {
                 .min(text.len()),
         );
         let search_area = text[search_start..search_end].to_lowercase();
+        let before_window = text[..search_start].chars().next_back();
+        let after_window = text[search_end..].chars().next();
 
         self.keywords
             .iter()
-            .any(|kw| search_area.contains(kw.as_str()))
+            .filter(|keyword| !keyword.is_empty())
+            .any(|keyword| {
+                search_area
+                    .match_indices(keyword.as_str())
+                    .any(|(start, word)| {
+                        let before = search_area[..start].chars().next_back().or(before_window);
+                        let after = search_area[start + word.len()..]
+                            .chars()
+                            .next()
+                            .or(after_window);
+                        !before.is_some_and(char::is_alphanumeric)
+                            && !after.is_some_and(char::is_alphanumeric)
+                    })
+            })
     }
 
     /// Extract candidate tokens from text — contiguous non-whitespace sequences
@@ -76,13 +91,10 @@ impl EntropyScanner {
 
         for (i, c) in text.char_indices() {
             if !c.is_whitespace()
-                && c != '"'
-                && c != '\''
-                && c != ','
-                && c != '{'
-                && c != '}'
-                && c != '['
-                && c != ']'
+                && !matches!(
+                    c,
+                    '"' | '\'' | '`' | ',' | '{' | '}' | '[' | ']' | '(' | ')' | ';'
+                )
             {
                 if start.is_none() {
                     start = Some(i);
@@ -270,6 +282,18 @@ mod tests {
         let text = "token = abc123";
         let matches = scanner.scan(text);
         assert!(matches.is_empty(), "Short tokens should be ignored");
+    }
+
+    #[test]
+    fn keyword_must_be_complete_even_at_the_edge_of_the_search_window() {
+        let mut config = test_config();
+        config.keywords = vec!["auth".to_string()];
+        config.keyword_proximity = 5;
+        let scanner = EntropyScanner::new(&config);
+        let candidate = "aB3xZ9mK2pL5nR8vQ4wE7jF1hG6";
+        assert_eq!(scanner.scan(&format!("auth {candidate}")).len(), 1);
+        assert!(scanner.scan(&format!("{candidate} authority")).is_empty());
+        assert!(scanner.scan(&format!("oauth {candidate}")).is_empty());
     }
 
     #[test]

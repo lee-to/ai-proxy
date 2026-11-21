@@ -608,6 +608,37 @@ async fn redaction_captures_controls_and_canaries_across_request_chunks() {
 }
 
 #[tokio::test]
+async fn http_json_scan_preserves_source_code_near_authority_identifiers() {
+    use ai_proxy::middleware::entropy_scanner::EntropyScanner;
+
+    let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+    let source = "let authority = request.uri().authority();\nreturn http::StatusCode::BAD_REQUEST.as_u16();";
+    let body = serde_json::json!({"messages":[{"role":"user","content":source}]}).to_string();
+    for mode in INSPECTING_MODES {
+        let entropy = Box::new(EntropyScanner::new(&config.scanner.entropy));
+        let mut fixture = Fixture::new(mode, Some(entropy)).await;
+        let response = fixture.request().body(body.clone()).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.capture().await, body.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn http_body_limit_returns_payload_too_large_in_both_proxy_modes() {
+    for mode in INSPECTING_MODES {
+        let mut fixture = Fixture::new(mode, None).await;
+        let response = fixture
+            .request()
+            .body(vec![b'a'; 1025])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        fixture.assert_not_inspected_or_forwarded();
+    }
+}
+
+#[tokio::test]
 async fn redaction_rejects_corrupt_compression_without_contacting_upstream() {
     for mode in INSPECTING_MODES {
         for (encoding, body) in [

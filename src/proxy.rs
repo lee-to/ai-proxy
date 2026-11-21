@@ -9,6 +9,7 @@ use flate2::read::GzDecoder;
 use futures_util::Stream;
 use futures_util::{SinkExt, StreamExt};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use http_body_util::LengthLimitError;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -16,6 +17,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use std::convert::Infallible;
+use std::error::Error;
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::pin::Pin;
@@ -239,6 +241,18 @@ async fn forward_request(
     ProxyRateLimits::check(&state.rate_limits.requests)?;
     let body_bytes = match axum::body::to_bytes(body, state.config.proxy.max_body_size).await {
         Ok(bytes) => bytes,
+        Err(error)
+            if error
+                .source()
+                .is_some_and(|source| source.is::<LengthLimitError>()) =>
+        {
+            warn!(
+                mode,
+                limit = state.config.proxy.max_body_size,
+                "Request body exceeds size limit"
+            );
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
         Err(e) => {
             error!(mode, error = %e, "Failed to read request body");
             return Err(StatusCode::BAD_REQUEST);
@@ -1015,6 +1029,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn websocket_upgrade_requires_both_header_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.append("connection", HeaderValue::from_static("keep-alive"));
+        headers.append("connection", HeaderValue::from_static("Upgrade"));
+        assert!(!is_websocket_upgrade(&headers));
+        headers.insert("upgrade", HeaderValue::from_static("h2c"));
+        assert!(!is_websocket_upgrade(&headers));
+        headers.insert("upgrade", HeaderValue::from_static("WebSocket"));
+        assert!(is_websocket_upgrade(&headers));
+        headers.remove("connection");
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn query_component_decodes_as_form_data_without_losing_equals_signs() {
+        assert_eq!(percent_decode_query_component("a=b=="), "a=b==");
+        assert_eq!(percent_decode_query_component("a+b%3D%3D"), "a b==");
+    }
+
+    #[test]
     fn prepare_capture_preview_omits_html_body() {
         let html = b"<!doctype html><html><body>cloudflare challenge</body></html>";
 
@@ -1295,7 +1329,7 @@ async fn handle_mitm_http_request(
         .absolute_url
         .unwrap_or_else(|| format!("https://{}{}", authority, path_and_query));
 
-    if is_websocket_upgrade(&headers) {
+    if method == Method::GET && is_websocket_upgrade(&headers) {
         if let Err(status) = ProxyRateLimits::check(&state.rate_limits.requests) {
             return status.into_response();
         }
@@ -1821,20 +1855,15 @@ fn has_subscription_bearer(headers: &HeaderMap) -> bool {
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
-    let has_upgrade_websocket = headers
-        .get("upgrade")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    let connection_has_upgrade = headers
-        .get("connection")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-        });
-
-    has_upgrade_websocket || connection_has_upgrade
+    let has_token = |header, expected| {
+        headers
+            .get_all(header)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case(expected))
+    };
+    has_token("upgrade", "websocket") && has_token("connection", "upgrade")
 }
 
 fn is_websocket_hop_header(name: &str) -> bool {
@@ -2341,9 +2370,11 @@ async fn scan_and_redact_query_params(
 }
 
 fn percent_decode_query_component(value: &str) -> String {
-    form_urlencoded::parse(value.as_bytes())
+    // Decode a value, preserving any literal '=' characters after the key.
+    let pair = format!("value={value}");
+    form_urlencoded::parse(pair.as_bytes())
         .next()
-        .map(|(value, _)| value.into_owned())
+        .map(|(_, value)| value.into_owned())
         .unwrap_or_default()
 }
 

@@ -108,6 +108,31 @@ mod tests {
     }
 
     #[test]
+    fn example_config_recognizes_supported_provider_key_formats() {
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../../config.example.toml")).unwrap();
+        let scanner = RegexScanner::new(&config.scanner.regex);
+        let sample = "abcdefghijklmnopqrstuvwxyz0123456789";
+        for (key, name) in [
+            (
+                format!("sk-ant-api03-synthetic_{sample}"),
+                "anthropic_api_key",
+            ),
+            (format!("sk-proj-synthetic_{sample}"), "openai_api_key"),
+            (format!("sk-svcacct-synthetic_{sample}"), "openai_api_key"),
+            (format!("sk-admin-synthetic_{sample}"), "openai_api_key"),
+            (format!("sk-{sample}"), "openai_api_key"),
+        ] {
+            let matches = scanner.scan(&key);
+            assert!(
+                matches
+                    .iter()
+                    .any(|m| m.pattern_name == name && m.value == key)
+            );
+        }
+    }
+
+    #[test]
     fn test_detect_aws_key() {
         let scanner = RegexScanner::new(&test_config());
         let text = "my key is AKIAIOSFODNN7EXAMPLE ok";
