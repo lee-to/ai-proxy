@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -224,6 +225,9 @@ pub fn window_start_ms(window_hours: u64) -> i64 {
 
 pub fn extract_model_from_json(bytes: &[u8]) -> Option<String> {
     let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    if let Some(request) = gemini_request(&value) {
+        return gemini_model(request).or_else(|| gemini_model(&value));
+    }
     extract_model_from_value(&value)
 }
 
@@ -231,9 +235,6 @@ fn extract_model_from_value(value: &Value) -> Option<String> {
     match value {
         Value::Object(object) => object
             .get("model")
-            .or_else(|| object.get("modelVersion"))
-            .or_else(|| object.get("model_version"))
-            .or_else(|| object.get("model_name"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .or_else(|| object.values().find_map(extract_model_from_value)),
@@ -253,110 +254,28 @@ pub fn extract_response_telemetry(
         return (Vec::new(), Vec::new());
     }
 
+    let mut telemetry = ParsedResponseTelemetry::new(request_id, model, upstream, source);
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        return telemetry_from_value(request_id, model, upstream, source, &value);
-    }
-
-    let mut usage = Vec::new();
-    let mut tools = Vec::new();
-    for line in String::from_utf8_lossy(bytes).lines() {
-        let trimmed = line.trim();
-        let Some(data) = trimmed.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        match serde_json::from_str::<Value>(data) {
-            Ok(value) => {
-                let (mut usage_rows, mut tool_rows) =
-                    telemetry_from_value(request_id, model, upstream, source, &value);
-                usage.append(&mut usage_rows);
-                tools.append(&mut tool_rows);
+        telemetry.observe(&value);
+    } else {
+        for line in String::from_utf8_lossy(bytes).lines() {
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
             }
-            Err(error) => {
-                debug!(request_id, source, error = %error, "Skipping non-JSON SSE telemetry event");
+            match serde_json::from_str::<Value>(data) {
+                Ok(value) => telemetry.observe(&value),
+                Err(error) => {
+                    debug!(request_id, source, error = %error, "Skipping non-JSON SSE telemetry event");
+                }
             }
         }
     }
 
-    let usage = consolidate_usage_records(usage);
-    let tools = deduplicate_tool_events(tools);
-
-    (usage, tools)
-}
-
-fn consolidate_usage_records(records: Vec<TokenUsageRecord>) -> Vec<TokenUsageRecord> {
-    if records.len() <= 1 {
-        return records;
-    }
-
-    let first = &records[0];
-    let request_id = first.request_id.clone();
-    let upstream = first.upstream.clone();
-    let source = first.source.clone();
-    let observed_at_ms = records
-        .iter()
-        .map(|r| r.observed_at_ms)
-        .max()
-        .unwrap_or_else(now_ms);
-
-    let model = records.iter().rev().find_map(|r| r.model.clone());
-
-    let input_tokens = records.iter().filter_map(|r| r.input_tokens).max();
-    let output_tokens = records.iter().filter_map(|r| r.output_tokens).max();
-    let recorded_total = records.iter().filter_map(|r| r.total_tokens).max();
-    let sum_total = match (input_tokens, output_tokens) {
-        (Some(i), Some(o)) => Some(i + o),
-        (Some(i), None) => Some(i),
-        (None, Some(o)) => Some(o),
-        (None, None) => None,
-    };
-    let total_tokens = match (recorded_total, sum_total) {
-        (Some(r), Some(s)) => Some(r.max(s)),
-        (Some(r), None) => Some(r),
-        (None, Some(s)) => Some(s),
-        (None, None) => None,
-    }
-    .filter(|t| *t > 0);
-
-    vec![TokenUsageRecord {
-        request_id,
-        observed_at_ms,
-        model,
-        upstream,
-        source,
-        input_tokens,
-        output_tokens,
-        total_tokens,
-    }]
-}
-
-fn deduplicate_tool_events(events: Vec<ToolEventRecord>) -> Vec<ToolEventRecord> {
-    let mut seen = std::collections::HashSet::new();
-    let mut deduplicated = Vec::new();
-    for event in events {
-        let key = if let Some(ref call_id) = event.call_id {
-            format!(
-                "{}:{}:{}",
-                event.event_kind,
-                call_id,
-                event.tool_name.as_deref().unwrap_or("")
-            )
-        } else {
-            format!(
-                "{}:{}:{}",
-                event.event_kind,
-                event.tool_name.as_deref().unwrap_or(""),
-                event.observed_at_ms
-            )
-        };
-        if seen.insert(key) {
-            deduplicated.push(event);
-        }
-    }
-    deduplicated
+    telemetry.finish()
 }
 
 pub fn extract_websocket_text_telemetry(
@@ -374,7 +293,9 @@ pub fn extract_websocket_text_telemetry(
         return (Vec::new(), Vec::new());
     };
 
-    telemetry_from_value(request_id, model, upstream, "websocket", &value)
+    let mut telemetry = ParsedResponseTelemetry::new(request_id, model, upstream, "websocket");
+    telemetry.observe(&value);
+    telemetry.finish()
 }
 
 pub fn extract_tool_events_from_json(
@@ -391,22 +312,230 @@ pub fn extract_tool_events_from_json(
     };
 
     let mut events = Vec::new();
-    collect_tool_events(&value, request_id, source, &mut events);
+    if let Some(request) = gemini_request(&value) {
+        collect_gemini_request_events(request, request_id, source, &mut events);
+    } else {
+        collect_tool_events(&value, request_id, source, &mut events);
+    }
     events
 }
 
-fn telemetry_from_value(
+struct ParsedResponseTelemetry<'a> {
+    request_id: &'a str,
+    model: Option<&'a str>,
+    upstream: &'a str,
+    source: &'a str,
+    usage: Vec<TokenUsageRecord>,
+    tools: Vec<ToolEventRecord>,
+    gemini_usage: GeminiUsage,
+    gemini_tool_ids: HashSet<(String, String)>,
+}
+
+impl<'a> ParsedResponseTelemetry<'a> {
+    fn new(
+        request_id: &'a str,
+        model: Option<&'a str>,
+        upstream: &'a str,
+        source: &'a str,
+    ) -> Self {
+        Self {
+            request_id,
+            model,
+            upstream,
+            source,
+            usage: Vec::new(),
+            tools: Vec::new(),
+            gemini_usage: GeminiUsage::default(),
+            gemini_tool_ids: HashSet::new(),
+        }
+    }
+
+    fn observe(&mut self, value: &Value) {
+        if let Value::Array(items) = value {
+            for item in items {
+                self.observe(item);
+            }
+            return;
+        }
+
+        if let Some(response) = gemini_response(value) {
+            self.gemini_usage.observe(value, response);
+            for content in array_items(response, "candidates").filter_map(|c| c.get("content")) {
+                let events = gemini_content_events(content, self.request_id, self.source);
+                self.tools.extend(events.filter(|event| {
+                    match event.call_id.as_deref() {
+                        Some(id) if !id.is_empty() => self
+                            .gemini_tool_ids
+                            .insert((event.event_kind.clone(), id.to_owned())),
+                        _ => true,
+                    }
+                }));
+            }
+            return;
+        }
+
+        collect_usage_records(
+            value,
+            self.request_id,
+            self.model,
+            self.upstream,
+            self.source,
+            &mut self.usage,
+        );
+        collect_tool_events(value, self.request_id, self.source, &mut self.tools);
+    }
+
+    fn finish(mut self) -> (Vec<TokenUsageRecord>, Vec<ToolEventRecord>) {
+        let GeminiUsage {
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        } = self.gemini_usage;
+        if input_tokens.is_some() || output_tokens.is_some() || total_tokens.is_some() {
+            let total_tokens = total_tokens.unwrap_or_else(|| {
+                input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(output_tokens.unwrap_or(0))
+            });
+            self.usage.push(TokenUsageRecord {
+                request_id: self.request_id.to_string(),
+                observed_at_ms: now_ms(),
+                model: model.or_else(|| self.model.map(ToOwned::to_owned)),
+                upstream: self.upstream.to_string(),
+                source: self.source.to_string(),
+                input_tokens,
+                output_tokens,
+                total_tokens: Some(total_tokens),
+            });
+        }
+        (self.usage, self.tools)
+    }
+}
+
+#[derive(Default)]
+struct GeminiUsage {
+    model: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+}
+
+impl GeminiUsage {
+    fn observe(&mut self, envelope: &Value, response: &Value) {
+        self.model = gemini_model(response)
+            .or_else(|| self.model.take())
+            .or_else(|| gemini_model(envelope));
+
+        let Some(metadata) = response.get("usageMetadata").and_then(Value::as_object) else {
+            return;
+        };
+        let input_tokens = first_i64(metadata, &["promptTokenCount"]).or(self.input_tokens);
+        let output_tokens = first_i64(metadata, &["candidatesTokenCount", "outputTokenCount"])
+            .or(self.output_tokens);
+        let total_tokens = first_i64(metadata, &["totalTokenCount"]);
+        // A total from an earlier snapshot can be stale when counters change.
+        if total_tokens.is_some()
+            || input_tokens != self.input_tokens
+            || output_tokens != self.output_tokens
+        {
+            self.total_tokens = total_tokens;
+        }
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+    }
+}
+
+fn gemini_response(value: &Value) -> Option<&Value> {
+    value
+        .get("response")
+        .into_iter()
+        .chain(std::iter::once(value))
+        .find(|response| {
+            response.get("usageMetadata").is_some_and(Value::is_object)
+                || response.get("candidates").is_some_and(Value::is_array)
+        })
+}
+
+fn gemini_request(value: &Value) -> Option<&Value> {
+    value
+        .get("request")
+        .into_iter()
+        .chain(std::iter::once(value))
+        .find(|request| {
+            request.get("contents").is_some_and(Value::is_array)
+                || array_items(request, "tools").any(|tool| {
+                    tool.get("functionDeclarations")
+                        .is_some_and(Value::is_array)
+                })
+        })
+}
+
+fn gemini_model(value: &Value) -> Option<String> {
+    first_string(
+        value.as_object()?,
+        &["modelVersion", "model_version", "model_name", "model"],
+    )
+}
+
+fn array_items<'a>(value: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn collect_gemini_request_events(
+    request: &Value,
     request_id: &str,
-    model: Option<&str>,
-    upstream: &str,
     source: &str,
-    value: &Value,
-) -> (Vec<TokenUsageRecord>, Vec<ToolEventRecord>) {
-    let mut usage = Vec::new();
-    let mut tools = Vec::new();
-    collect_usage_records(value, request_id, model, upstream, source, &mut usage);
-    collect_tool_events(value, request_id, source, &mut tools);
-    (usage, tools)
+    events: &mut Vec<ToolEventRecord>,
+) {
+    for tool in array_items(request, "tools") {
+        for declaration in array_items(tool, "functionDeclarations") {
+            if let Some(name) = declaration.get("name").and_then(Value::as_str) {
+                events.push(ToolEventRecord {
+                    request_id: request_id.to_string(),
+                    observed_at_ms: now_ms(),
+                    event_kind: "tool_definition".to_string(),
+                    tool_name: Some(name.to_string()),
+                    call_id: None,
+                    status: None,
+                    source: source.to_string(),
+                });
+            }
+        }
+    }
+    for content in array_items(request, "contents") {
+        events.extend(gemini_content_events(content, request_id, source));
+    }
+}
+
+fn gemini_content_events<'a>(
+    content: &'a Value,
+    request_id: &'a str,
+    source: &'a str,
+) -> impl Iterator<Item = ToolEventRecord> + 'a {
+    array_items(content, "parts").flat_map(move |part| {
+        [
+            ("functionCall", "tool_call"),
+            ("functionResponse", "tool_result"),
+        ]
+        .into_iter()
+        .filter_map(move |(field, event_kind)| {
+            let tool = part.get(field)?.as_object()?;
+            Some(ToolEventRecord {
+                request_id: request_id.to_string(),
+                observed_at_ms: now_ms(),
+                event_kind: event_kind.to_string(),
+                tool_name: first_string(tool, &["name", "tool_name"]),
+                call_id: first_string(tool, &["id", "call_id", "tool_call_id"]),
+                status: first_string(tool, &["status"]),
+                source: source.to_string(),
+            })
+        })
+    })
 }
 
 fn collect_usage_records(
@@ -419,11 +548,7 @@ fn collect_usage_records(
 ) {
     match value {
         Value::Object(object) => {
-            let current_model = model
-                .or_else(|| object.get("model").and_then(Value::as_str))
-                .or_else(|| object.get("modelVersion").and_then(Value::as_str))
-                .or_else(|| object.get("model_version").and_then(Value::as_str))
-                .or_else(|| object.get("model_name").and_then(Value::as_str));
+            let current_model = model.or_else(|| object.get("model").and_then(Value::as_str));
             if let Some(record) =
                 usage_record_from_object(request_id, current_model, upstream, source, value)
             {
@@ -461,7 +586,6 @@ fn usage_record_from_object(
             "prompt_tokens",
             "promptTokens",
             "inputTokens",
-            "promptTokenCount",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
         ],
@@ -473,11 +597,9 @@ fn usage_record_from_object(
             "completion_tokens",
             "completionTokens",
             "outputTokens",
-            "candidatesTokenCount",
-            "outputTokenCount",
         ],
     );
-    let total_tokens = first_i64(object, &["total_tokens", "totalTokens", "totalTokenCount"])
+    let total_tokens = first_i64(object, &["total_tokens", "totalTokens"])
         .or_else(|| Some(input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0)))
         .filter(|total| *total > 0);
 
@@ -518,46 +640,7 @@ fn collect_tool_events(
                             source: source.to_string(),
                         });
                     }
-                    if let Some(Value::Array(decls)) = tool.get("functionDeclarations") {
-                        for decl in decls {
-                            if let Some(name) = decl.get("name").and_then(Value::as_str) {
-                                events.push(ToolEventRecord {
-                                    request_id: request_id.to_string(),
-                                    observed_at_ms: now_ms(),
-                                    event_kind: "tool_definition".to_string(),
-                                    tool_name: Some(name.to_string()),
-                                    call_id: None,
-                                    status: None,
-                                    source: source.to_string(),
-                                });
-                            }
-                        }
-                    }
                 }
-            }
-
-            if let Some(func_call) = object.get("functionCall").and_then(Value::as_object) {
-                events.push(ToolEventRecord {
-                    request_id: request_id.to_string(),
-                    observed_at_ms: now_ms(),
-                    event_kind: "tool_call".to_string(),
-                    tool_name: first_string(func_call, &["name", "tool_name"]),
-                    call_id: first_string(func_call, &["id", "call_id", "tool_call_id"]),
-                    status: None,
-                    source: source.to_string(),
-                });
-            }
-
-            if let Some(func_resp) = object.get("functionResponse").and_then(Value::as_object) {
-                events.push(ToolEventRecord {
-                    request_id: request_id.to_string(),
-                    observed_at_ms: now_ms(),
-                    event_kind: "tool_result".to_string(),
-                    tool_name: first_string(func_resp, &["name", "tool_name"]),
-                    call_id: first_string(func_resp, &["id", "call_id", "tool_call_id"]),
-                    status: first_string(func_resp, &["status"]),
-                    source: source.to_string(),
-                });
             }
 
             if let Some(event_kind) = tool_event_kind(object.get("type").and_then(Value::as_str)) {
@@ -754,68 +837,181 @@ mod tests {
         assert_eq!(events[1].call_id.as_deref(), Some("call_1"));
     }
 
-    #[test]
-    fn extracts_gemini_usage_metadata_from_json() {
-        let (usage, tools) = extract_response_telemetry(
-            "req-gemini",
-            None,
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent",
-            "response",
-            br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}],"usageMetadata":{"promptTokenCount":228,"candidatesTokenCount":12,"totalTokenCount":240},"modelVersion":"gemini-3.8-flash-medium"}}"#,
-        );
+    const GEMINI_UPSTREAM: &str =
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini:streamGenerateContent";
+    const ANTIGRAVITY_UPSTREAM: &str =
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent";
 
-        assert!(tools.is_empty());
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].model.as_deref(), Some("gemini-3.8-flash-medium"));
-        assert_eq!(usage[0].input_tokens, Some(228));
-        assert_eq!(usage[0].output_tokens, Some(12));
-        assert_eq!(usage[0].total_tokens, Some(240));
+    #[test]
+    fn extracts_gemini_model_and_tools_from_antigravity_request() {
+        let request = br#"{
+            "model_name": "gemini-alias",
+            "request": {
+                "tools": [{"functionDeclarations": [{"name": "read_file"}]}],
+                "contents": [{"parts": [
+                    {"functionResponse": {
+                        "id": "call_1",
+                        "name": "read_file",
+                        "response": {"type": "tool_use", "name": "nested_value"}
+                    }}
+                ]}]
+            }
+        }"#;
+
+        assert_eq!(
+            extract_model_from_json(request).as_deref(),
+            Some("gemini-alias")
+        );
+        let tools = extract_tool_events_from_json("req-test", request, "request");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].event_kind, "tool_definition");
+        assert_eq!(tools[0].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(tools[1].event_kind, "tool_result");
+        assert_eq!(tools[1].call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
-    fn extracts_gemini_sse_stream_usage_without_inflation() {
-        let sse_data = b"data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}],\"usageMetadata\":{\"promptTokenCount\":100,\"totalTokenCount\":100},\"modelVersion\":\"gemini-3.5-flash-lite\"}}\n\ndata: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]}}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":5,\"totalTokenCount\":105},\"modelVersion\":\"gemini-3.5-flash-lite\"}}\n\ndata: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"!\"}]}}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":20,\"totalTokenCount\":120},\"modelVersion\":\"gemini-3.5-flash-lite\"}}\n\n";
+    fn merges_gemini_usage_in_json_arrays_and_sse() {
+        let chunks = [
+            r#"{"response":{"modelVersion":"gemini-version","usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":105}}}"#,
+            r#"{"response":{"usageMetadata":{"outputTokenCount":20,"thoughtsTokenCount":7,"totalTokenCount":127}}}"#,
+            r#"{"model":"gemini-alias","response":{"candidates":[{"content":{"parts":[{"text":"Done"}]}}]}}"#,
+        ];
+        let json_array = format!("[{}]", chunks.join(","));
+        let sse = format!("data: {}\n\n", chunks.join("\n\ndata: "));
+        for body in [json_array, sse] {
+            let (usage, tools) = extract_response_telemetry(
+                "req-test",
+                Some("gemini-alias"),
+                ANTIGRAVITY_UPSTREAM,
+                "response",
+                body.as_bytes(),
+            );
+            assert!(tools.is_empty());
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0].model.as_deref(), Some("gemini-version"));
+            assert_eq!(usage[0].input_tokens, Some(100));
+            assert_eq!(usage[0].output_tokens, Some(20));
+            assert_eq!(usage[0].total_tokens, Some(127));
+        }
+    }
 
-        let (usage, tools) = extract_response_telemetry(
-            "req-gemini-sse",
-            None,
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
-            "response",
-            sse_data,
-        );
-
-        assert!(tools.is_empty());
+    #[test]
+    fn derives_gemini_total_when_later_usage_omits_it() {
+        let body = br#"[
+            {"usageMetadata":{"promptTokenCount":100,"outputTokenCount":5,"totalTokenCount":105}},
+            {"usageMetadata":{"outputTokenCount":20}}
+        ]"#;
+        let (usage, _) =
+            extract_response_telemetry("req-test", None, GEMINI_UPSTREAM, "response", body);
         assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].model.as_deref(), Some("gemini-3.5-flash-lite"));
         assert_eq!(usage[0].input_tokens, Some(100));
         assert_eq!(usage[0].output_tokens, Some(20));
         assert_eq!(usage[0].total_tokens, Some(120));
     }
 
     #[test]
-    fn extracts_gemini_tools_and_declarations() {
-        let req_json = br#"{"tools":[{"functionDeclarations":[{"name":"read_file","description":"read a file"}]}],"contents":[{"role":"user","parts":[{"functionResponse":{"id":"call_99","name":"read_file","response":{"content":"test"}}}]}]}"#;
-        let req_events = extract_tool_events_from_json("req-gtools", req_json, "request");
+    fn reads_gemini_counters_only_from_response_metadata() {
+        let body = br#"{
+            "modelVersion":"gemini-version",
+            "usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"totalTokenCount":120},
+            "candidates":[{"content":{"parts":[{"functionCall":{
+                "name":"process_report",
+                "args":{
+                    "usageMetadata":{"promptTokenCount":200,"totalTokenCount":210},
+                    "promptTokenCount":200,
+                    "totalTokenCount":210,
+                    "type":"tool_result",
+                    "name":"nested_value"
+                }
+            }}]}}]
+        }"#;
+        let (usage, tools) =
+            extract_response_telemetry("req-test", None, GEMINI_UPSTREAM, "response", body);
 
-        assert_eq!(req_events.len(), 2);
-        assert_eq!(req_events[0].event_kind, "tool_definition");
-        assert_eq!(req_events[0].tool_name.as_deref(), Some("read_file"));
-        assert_eq!(req_events[1].event_kind, "tool_result");
-        assert_eq!(req_events[1].call_id.as_deref(), Some("call_99"));
-        assert_eq!(req_events[1].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].model.as_deref(), Some("gemini-version"));
+        assert_eq!(usage[0].input_tokens, Some(100));
+        assert_eq!(usage[0].output_tokens, Some(20));
+        assert_eq!(usage[0].total_tokens, Some(120));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].event_kind, "tool_call");
+        assert_eq!(tools[0].tool_name.as_deref(), Some("process_report"));
+    }
 
-        let resp_json = br#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_100","name":"run_command","args":{"cmd":"ls"}}}]}}]}}"#;
-        let (_, resp_tools) = extract_response_telemetry(
-            "req-gtools",
+    #[test]
+    fn deduplicates_gemini_sse_tools_only_with_stable_ids() {
+        let body = concat!(
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"first"}}},{"functionCall":{"name":"read_file","args":{"path":"second"}}},{"functionCall":{"id":"call_1","name":"read_file"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"read_file"}},{"functionResponse":{"id":"call_1","name":"read_file"}}]}}]}"#,
+            "\n\n",
+        );
+        let (usage, tools) = extract_response_telemetry(
+            "req-test",
             None,
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent",
+            GEMINI_UPSTREAM,
             "response",
-            resp_json,
+            body.as_bytes(),
         );
 
-        assert_eq!(resp_tools.len(), 1);
-        assert_eq!(resp_tools[0].event_kind, "tool_call");
-        assert_eq!(resp_tools[0].call_id.as_deref(), Some("call_100"));
-        assert_eq!(resp_tools[0].tool_name.as_deref(), Some("run_command"));
+        assert!(usage.is_empty());
+        let events: Vec<_> = tools
+            .iter()
+            .map(|tool| (tool.event_kind.as_str(), tool.call_id.as_deref()))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("tool_call", None),
+                ("tool_call", None),
+                ("tool_call", Some("call_1")),
+                ("tool_result", Some("call_1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn retains_anthropic_sse_usage_records() {
+        let body = concat!(
+            r#"data: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":40,"output_tokens":1}}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","usage":{"output_tokens":12}}"#,
+            "\n\n",
+        );
+        let (usage, _) = extract_response_telemetry(
+            "req-test",
+            None,
+            "https://api.anthropic.com/v1/messages",
+            "response",
+            body.as_bytes(),
+        );
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].model.as_deref(), Some("claude-test"));
+        assert_eq!(usage[0].total_tokens, Some(41));
+        assert_eq!(usage[1].total_tokens, Some(12));
+    }
+
+    #[test]
+    fn retains_codex_sse_tool_events() {
+        let body = concat!(
+            r#"data: {"type":"response.output_item.added","item":{"type":"function_call","name":"shell","call_id":"call_1"}}"#,
+            "\n\n",
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","name":"shell","call_id":"call_1"}}"#,
+            "\n\n",
+        );
+        let (_, tools) = extract_response_telemetry(
+            "req-test",
+            None,
+            "https://api.openai.com/v1/responses",
+            "response",
+            body.as_bytes(),
+        );
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.call_id.as_deref() == Some("call_1"))
+        );
     }
 }
