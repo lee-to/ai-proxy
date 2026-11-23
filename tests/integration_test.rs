@@ -82,10 +82,12 @@ async fn start_sse_upstream() -> (String, tokio::task::JoinHandle<()>) {
     (url, handle)
 }
 
-async fn start_sse_placeholder_upstream() -> (String, tokio::task::JoinHandle<()>) {
+async fn start_sse_placeholder_upstream(
+    release: Arc<tokio::sync::Notify>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::body::Body;
     use axum::response::Response;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -94,16 +96,23 @@ async fn start_sse_placeholder_upstream() -> (String, tokio::task::JoinHandle<()
     let handle = tokio::spawn(async move {
         let app = Router::new().route(
             "/{*path}",
-            any(|| async {
-                let chunks = vec![
-                    Ok::<_, std::io::Error>(Bytes::from("data: hello [EMA")),
-                    Ok(Bytes::from("IL_1]\n\n")),
-                ];
-                let body = Body::from_stream(stream::iter(chunks));
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(body)
-                    .unwrap()
+            any(move || {
+                let release = release.clone();
+                async move {
+                    let heartbeat = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b": keep-alive\n",
+                    ))]);
+                    let first_data = stream::once(async move {
+                        release.notified().await;
+                        Ok(Bytes::from_static(b"data: hello [EMA"))
+                    });
+                    let tail = stream::iter([Ok(Bytes::from_static(b"IL_1]\n\n"))]);
+                    let body = Body::from_stream(heartbeat.chain(first_data).chain(tail));
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
             }),
         );
         axum::serve(listener, app).await.unwrap();
@@ -1011,19 +1020,30 @@ async fn test_proxy_full_scan_restores_header_and_query_placeholders() {
 }
 
 #[tokio::test]
-async fn test_proxy_restores_split_sse_placeholder() {
-    let (upstream_url, _upstream_handle) = start_sse_placeholder_upstream().await;
+async fn test_proxy_streams_heartbeat_before_restoring_split_sse_placeholder() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (upstream_url, _upstream_handle) = start_sse_placeholder_upstream(release.clone()).await;
     let (proxy_url, _proxy_handle) =
         start_proxy_with_placeholder_restore(&upstream_url, "body").await;
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let response = client
+    let request = client
         .post(format!("{}/v1/messages", proxy_url))
         .header("content-type", "application/json")
-        .body(r#"{"email":"ada@example.com"}"#)
-        .send()
-        .await
-        .unwrap();
+        .body(r#"{"email":"ada@example.com"}"#);
+    // The upstream sends its first data event only after the client sees the heartbeat.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut response = request.send().await.unwrap();
+        let mut prefix = Vec::new();
+        while prefix.len() < b": keep-alive\n".len() {
+            prefix.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+        }
+        assert_eq!(prefix, b": keep-alive\n");
+        response
+    })
+    .await
+    .expect("heartbeat buffered by proxy");
+    release.notify_one();
 
     let body = response.text().await.unwrap();
     assert!(

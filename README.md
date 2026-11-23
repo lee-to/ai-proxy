@@ -14,7 +14,7 @@ Codex CLI    -->  ai-proxy (localhost:8080)  -->  api.openai.com
 - **Partial masking**: `sk-ant-abcdef...xyz` becomes `sk-***...***xyz`
 - **Typed placeholders**: optional reversible PII pseudonymization such as `ada@example.com` to `[EMAIL_1]`
 - **Local model scanner**: optional OpenAI-compatible/Ollama-style semantic PII scanner for hybrid detection
-- **SSE streaming**: responses stream through without buffering
+- **SSE streaming**: heartbeat comments pass through immediately, including during placeholder restoration
 - **Configurable scan scope**: body-only or full (body + headers + query params)
 - **Anthropic + Codex routing**: Anthropic-compatible requests go to `anthropic_upstream_url`; OpenAI Responses/Codex requests go to `codex_upstream_url` or `codex_subscription_url`
 - **HTTP CONNECT + MITM**: clients that use `HTTP_PROXY`/`HTTPS_PROXY` can use blind tunnels or local MITM inspection with WebSocket proxying
@@ -242,8 +242,9 @@ A secret like `sk-ant-abcdef123456789xyz` becomes `sk-***...***xyz`. The entire 
 Set `strategy = "placeholder"` to send typed placeholders upstream instead of masked values. PII categories listed in `restorable_categories` can be restored in downstream HTTP responses when `response_restore_enabled = true`; `person_name` is not restorable by default and should only be added when restoring names to the client is safe for your deployment. Secret categories such as API keys, passwords, private keys, JWTs, and connection strings are not restored by default. Request-local placeholder maps are kept only for the active request/response and are not logged.
 
 Chunked responses use a bounded rolling buffer so placeholders split across network chunks can
-still be restored. SSE restoration buffers one event at a time and escapes restored values in
-JSON data. Events larger than 1 MiB pass through unchanged. WebSocket MITM inspection currently
+still be restored. During SSE restoration, heartbeat comments pass through immediately while the
+proxy buffers one event at a time to escape restored values in JSON. Events whose fields exceed
+the 1 MiB buffer pass through without restoration. WebSocket MITM inspection currently
 redacts client-to-upstream text frames only; server-to-client WebSocket restoration is intentionally
 not enabled in this implementation.
 

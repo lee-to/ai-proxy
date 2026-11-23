@@ -26,7 +26,9 @@ pub struct RedactionContext {
     response_restore_enabled: bool,
     restorable_categories: HashSet<String>,
     entries: Vec<PlaceholderEntry>,
-    placeholders_by_value: HashMap<(String, String), String>,
+    // Both wire spellings point to the same request-local entry.
+    restore_tokens: Vec<(String, usize)>,
+    entries_by_value: HashMap<(String, String), usize>,
     counts_by_category: BTreeMap<String, usize>,
 }
 
@@ -49,7 +51,8 @@ impl RedactionContext {
                 .map(|category| category.to_ascii_lowercase())
                 .collect(),
             entries: Vec::new(),
-            placeholders_by_value: HashMap::new(),
+            restore_tokens: Vec::new(),
+            entries_by_value: HashMap::new(),
             counts_by_category: BTreeMap::new(),
         }
     }
@@ -62,6 +65,10 @@ impl RedactionContext {
         self.entries.is_empty()
     }
 
+    pub(crate) fn has_restorable_values(&self) -> bool {
+        !self.restore_tokens.is_empty()
+    }
+
     pub fn max_placeholder_len(&self) -> usize {
         self.entries
             .iter()
@@ -72,13 +79,18 @@ impl RedactionContext {
 
     pub fn placeholder_for(&mut self, finding: &ScanMatch) -> String {
         let key = (finding.category.clone(), finding.value.clone());
-        if let Some(existing) = self.placeholders_by_value.get(&key) {
+        if let Some(&index) = self.entries_by_value.get(&key) {
+            let existing = &mut self.entries[index];
+            if existing.restore_allowed && finding.restore_policy == RESTORE_POLICY_NEVER {
+                existing.restore_allowed = false;
+                self.restore_tokens.retain(|(_, entry)| *entry != index);
+            }
             trace!(
                 request_id = %self.request_id,
                 category = %finding.category,
                 "Reusing existing placeholder"
             );
-            return existing.clone();
+            return existing.placeholder.clone();
         }
 
         let counter = self
@@ -93,13 +105,19 @@ impl RedactionContext {
                 .restorable_categories
                 .contains(&finding.category.to_ascii_lowercase());
 
+        let index = self.entries.len();
+        if restore_allowed {
+            self.restore_tokens.push((placeholder.clone(), index));
+            self.restore_tokens
+                .push((percent_encode_placeholder(&placeholder), index));
+        }
         self.entries.push(PlaceholderEntry {
             placeholder: placeholder.clone(),
             original: finding.value.clone(),
             category: finding.category.clone(),
             restore_allowed,
         });
-        self.placeholders_by_value.insert(key, placeholder.clone());
+        self.entries_by_value.insert(key, index);
         debug!(
             request_id = %self.request_id,
             category = %finding.category,
@@ -161,22 +179,11 @@ impl RedactionContext {
     ) -> (String, BTreeMap<String, usize>) {
         let mut restored = String::with_capacity(text.len());
         let mut counts_by_category = BTreeMap::new();
-        let replacements: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.restore_allowed)
-            .flat_map(|entry| {
-                [
-                    (entry.placeholder.clone(), entry),
-                    (percent_encode_placeholder(&entry.placeholder), entry),
-                ]
-            })
-            .collect();
-
         let mut cursor = 0;
         while cursor < text.len() {
             let remaining = &text[cursor..];
-            let Some((placeholder, entry)) = replacements
+            let Some((placeholder, index)) = self
+                .restore_tokens
                 .iter()
                 .find(|(placeholder, _)| remaining.starts_with(placeholder.as_str()))
             else {
@@ -188,6 +195,7 @@ impl RedactionContext {
                 continue;
             };
 
+            let entry = &self.entries[*index];
             if json_strings {
                 let encoded = serde_json::to_string(&entry.original)
                     .expect("serializing a JSON string cannot fail");
@@ -308,15 +316,18 @@ impl StreamingRestore {
     }
 
     fn longest_placeholder_prefix_suffix(&self) -> usize {
-        let max_len = self.context.max_placeholder_len().saturating_sub(1);
-        let max_candidate = self.pending.len().min(max_len);
+        let tokens = &self.context.restore_tokens;
+        let max_len = tokens
+            .iter()
+            .map(|(token, _)| token.len())
+            .max()
+            .unwrap_or(0);
+        let max_candidate = self.pending.len().min(max_len.saturating_sub(1));
         for len in (1..=max_candidate).rev() {
             let suffix = &self.pending[self.pending.len() - len..];
-            if self
-                .context
-                .entries
+            if tokens
                 .iter()
-                .any(|entry| entry.placeholder.as_bytes().starts_with(suffix))
+                .any(|(token, _)| token.len() > len && token.as_bytes().starts_with(suffix))
             {
                 debug!(
                     request_id = %self.context.request_id(),
@@ -330,38 +341,84 @@ impl StreamingRestore {
     }
 }
 
+#[derive(Default, PartialEq)]
+enum SseLine {
+    #[default]
+    Start,
+    Field,
+    Comment,
+}
+
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
 #[derive(Default)]
 struct SseBuffer {
     event: Vec<u8>,
-    line_has_text: bool,
-    pending_cr: bool,
+    line: SseLine,
+    checked_bom: bool,
+    // A following LF belongs to the same line and must go to the same destination.
+    cr_was_forwarded: Option<bool>,
     passthrough: bool,
 }
 
 impl SseBuffer {
     fn push(&mut self, context: &RedactionContext, chunk: &[u8]) -> RestoreReport {
-        const MAX_EVENT_BYTES: usize = 1024 * 1024;
-
         let mut output = Vec::new();
         let mut counts = BTreeMap::new();
         for &byte in chunk {
-            if std::mem::take(&mut self.pending_cr) && byte != b'\n' {
-                self.end_line(context, &mut output, &mut counts);
+            if !self.checked_bom {
+                const BOM: &[u8] = b"\xef\xbb\xbf";
+                if byte == BOM[self.event.len()] {
+                    self.event.push(byte);
+                    if self.event.len() == BOM.len() {
+                        output.append(&mut self.event);
+                        self.checked_bom = true;
+                    }
+                    continue;
+                }
+                self.checked_bom = true;
+                if !self.event.is_empty() {
+                    self.line = SseLine::Field;
+                }
             }
-            if self.event.len() == MAX_EVENT_BYTES {
-                // Preserve oversized events unchanged while keeping memory bounded.
-                output.append(&mut self.event);
-                self.passthrough = true;
+
+            if let Some(forwarded) = self.cr_was_forwarded.take()
+                && byte == b'\n'
+            {
+                self.write_byte(byte, forwarded, &mut output);
+                continue;
             }
-            if self.passthrough {
-                output.push(byte);
-            } else {
-                self.event.push(byte);
+
+            let end_line = matches!(byte, b'\r' | b'\n');
+            if self.line == SseLine::Start && !end_line {
+                self.line = if byte == b':' {
+                    SseLine::Comment
+                } else {
+                    SseLine::Field
+                };
             }
-            match byte {
-                b'\r' => self.pending_cr = true,
-                b'\n' => self.end_line(context, &mut output, &mut counts),
-                _ => self.line_has_text = true,
+            let blank = self.line == SseLine::Start;
+            if blank {
+                if !self.event.is_empty() {
+                    // An intervening heartbeat may already have been forwarded.
+                    // Keep a buffered bare CR and a blank LF as two line breaks.
+                    let separate_lf = self.event.ends_with(b"\r") && byte == b'\n';
+                    let report = restore_sse_event(context, std::mem::take(&mut self.event));
+                    output.extend_from_slice(&report.bytes);
+                    if separate_lf {
+                        output.push(b'\n');
+                    }
+                    for (category, count) in report.counts_by_category {
+                        *counts.entry(category).or_default() += count;
+                    }
+                }
+                self.passthrough = false;
+            }
+            let forward = blank || self.line == SseLine::Comment;
+            self.write_byte(byte, forward, &mut output);
+            if end_line {
+                self.cr_was_forwarded = (byte == b'\r').then_some(forward || self.passthrough);
+                self.line = SseLine::Start;
             }
         }
         RestoreReport {
@@ -370,20 +427,15 @@ impl SseBuffer {
         }
     }
 
-    fn end_line(
-        &mut self,
-        context: &RedactionContext,
-        output: &mut Vec<u8>,
-        counts: &mut BTreeMap<String, usize>,
-    ) {
-        if std::mem::take(&mut self.line_has_text) {
-            return;
+    fn write_byte(&mut self, byte: u8, forward: bool, output: &mut Vec<u8>) {
+        if !forward && self.event.len() == MAX_SSE_EVENT_BYTES {
+            output.append(&mut self.event);
+            self.passthrough = true;
         }
-        self.passthrough = false;
-        let report = restore_sse_event(context, std::mem::take(&mut self.event));
-        output.extend_from_slice(&report.bytes);
-        for (category, count) in report.counts_by_category {
-            *counts.entry(category).or_default() += count;
+        if forward || self.passthrough {
+            output.push(byte);
+        } else {
+            self.event.push(byte);
         }
     }
 }
@@ -441,31 +493,18 @@ fn restore_sse_event(context: &RedactionContext, event: Vec<u8>) -> RestoreRepor
 }
 
 fn floor_utf8_boundary(bytes: &[u8], index: usize) -> usize {
-    let mut idx = index.min(bytes.len());
-    while idx > 0 && bytes[idx - 1] & 0b1100_0000 == 0b1000_0000 {
-        idx -= 1;
+    // Only a valid, incomplete UTF-8 suffix can be completed by the next chunk.
+    for start in (index.saturating_sub(3)..index).rev() {
+        if bytes[start] & 0xc0 != 0x80 {
+            if let Err(error) = std::str::from_utf8(&bytes[start..index])
+                && error.error_len().is_none()
+            {
+                return start;
+            }
+            break;
+        }
     }
-    if idx == 0 {
-        return 0;
-    }
-    let leader_pos = idx - 1;
-    let leader = bytes[leader_pos];
-    let needed = if leader & 0b1000_0000 == 0 {
-        1
-    } else if leader & 0b1110_0000 == 0b1100_0000 {
-        2
-    } else if leader & 0b1111_0000 == 0b1110_0000 {
-        3
-    } else if leader & 0b1111_1000 == 0b1111_0000 {
-        4
-    } else {
-        return leader_pos;
-    };
-    if leader_pos + needed <= index {
-        leader_pos + needed
-    } else {
-        leader_pos
-    }
+    index
 }
 
 #[cfg(test)]
@@ -513,6 +552,7 @@ mod tests {
         let placeholder = context.placeholder_for(&finding);
         let (restored, counts) = context.restore_text(&format!("key={placeholder}"));
 
+        assert!(!context.has_restorable_values());
         assert_eq!(placeholder, "[API_KEY_1]");
         assert_eq!(restored, "key=[API_KEY_1]");
         assert!(counts.is_empty());
@@ -569,6 +609,121 @@ mod tests {
             plain_event,
             "data: Hello Ada \"A\" \\ Lovelace\ndata: London\n\n"
         );
+    }
+
+    fn name_context(name: &str) -> RedactionContext {
+        let mut context = RedactionContext::new("req-stream", &placeholder_config());
+        let finding = ScanMatch::new(name.into(), "model", "person_name", 0, name.len(), 0.95);
+        assert_eq!(context.placeholder_for(&finding), "[PERSON_NAME_1]");
+        context
+    }
+
+    #[test]
+    fn reuse_keeps_the_strictest_restore_policy_in_either_order() {
+        let allowed = ScanMatch::new("Ada".into(), "model", "person_name", 0, 3, 1.0);
+        let mut restricted = allowed.clone();
+        restricted.restore_policy = RESTORE_POLICY_NEVER.into();
+        for findings in [[&allowed, &restricted], [&restricted, &allowed]] {
+            let mut context = RedactionContext::new("req-policy", &placeholder_config());
+            for finding in findings {
+                assert_eq!(context.placeholder_for(finding), "[PERSON_NAME_1]");
+            }
+            assert!(!context.has_restorable_values());
+            let text = "[PERSON_NAME_1] %5BPERSON_NAME_1%5D";
+            let (result, counts) = context.restore_text(text);
+            assert_eq!(result, text);
+            assert!(counts.is_empty());
+        }
+    }
+
+    #[test]
+    fn sse_initial_bom_survives_chunk_splits_and_is_recognized_only_once() {
+        let name = "Ada \"A\"";
+        let input = "\u{feff}data: {\ndata: \"name\":\"[PERSON_NAME_1]\"}\n\n\u{feff}data: [PERSON_NAME_1]\n\n";
+        let expected = format!(
+            "\u{feff}data: {{\ndata: \"name\":{}}}\n\n\u{feff}data: [PERSON_NAME_1]\n\n",
+            serde_json::to_string(name).unwrap()
+        );
+        let mut stream = StreamingRestore::for_sse(name_context(name));
+        let mut output = Vec::new();
+        for byte in input.bytes() {
+            output.extend_from_slice(&stream.push(Bytes::from(vec![byte])).bytes);
+        }
+        assert!(stream.finish().is_none());
+        assert_eq!(output, expected.as_bytes());
+    }
+
+    #[test]
+    fn sse_comments_stream_during_an_event_and_cr_dispatches_without_lookahead() {
+        for end in ["\n", "\r", "\r\n"] {
+            let mut stream = StreamingRestore::for_sse(name_context("Ada"));
+            assert_eq!(
+                stream.push(Bytes::from("\u{feff}: leading")).bytes,
+                "\u{feff}: leading"
+            );
+            assert_eq!(stream.push(Bytes::from(end)).bytes, end);
+            let data = format!("data: [PERSON_NAME_1]{end}");
+            assert!(stream.push(Bytes::from(data)).bytes.is_empty());
+            for part in [":", " heartbeat", end] {
+                assert_eq!(stream.push(Bytes::from(part)).bytes, part);
+            }
+            let report = stream.push(Bytes::from(end));
+            assert_eq!(report.bytes, format!("data: Ada{end}{end}"));
+            assert_eq!(report.counts_by_category["person_name"], 1);
+            assert!(stream.finish().is_none());
+        }
+        // Moving a comment ahead of pending data must not collapse CR + blank LF.
+        let mut stream = StreamingRestore::for_sse(name_context("Ada"));
+        let report = stream.push(Bytes::from("data: x\r: ping\n\n"));
+        assert_eq!(report.bytes, ": ping\ndata: x\r\n\n");
+    }
+
+    #[test]
+    fn sse_oversized_field_passes_through_and_next_event_restores() {
+        let mut stream = StreamingRestore::for_sse(name_context("Ada"));
+        let oversized = format!(
+            "data: {}[PERSON_NAME_1]\r\n\r\n",
+            "x".repeat(MAX_SSE_EVENT_BYTES)
+        );
+        let mut output = Vec::new();
+        for chunk in oversized.as_bytes().chunks(997) {
+            output.extend_from_slice(&stream.push(Bytes::copy_from_slice(chunk)).bytes);
+        }
+        assert_eq!(output, oversized.as_bytes());
+        assert_eq!(
+            stream.push(Bytes::from("data: [PERSON_NAME_1]\n\n")).bytes,
+            "data: Ada\n\n"
+        );
+        assert!(stream.finish().is_none());
+    }
+
+    #[test]
+    fn streaming_restore_handles_every_split_of_a_percent_encoded_placeholder() {
+        let wire = "%5BPERSON_NAME_1%5D";
+        for split in 0..=wire.len() {
+            let mut stream = StreamingRestore::new(name_context("Ada"));
+            let first = stream.push(Bytes::from_static(&wire.as_bytes()[..split]));
+            let second = stream.push(Bytes::from_static(&wire.as_bytes()[split..]));
+            assert_eq!(
+                [first.bytes, second.bytes].concat(),
+                b"Ada",
+                "split at {split}"
+            );
+            assert!(stream.finish().is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_passes_through_without_growing_the_stream_buffer() {
+        let mut stream = StreamingRestore::new(name_context("Ada"));
+        for chunk in [&[0xff][..], &[0x80; 8], &[0xf0, 0x80]] {
+            assert_eq!(
+                stream.push(Bytes::copy_from_slice(chunk)).bytes.as_ref(),
+                chunk
+            );
+        }
+        assert_eq!(stream.push(Bytes::from("[PERSON_NAME_1]")).bytes, "Ada");
+        assert!(stream.finish().is_none());
     }
 
     #[test]

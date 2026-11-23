@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use futures_util::Stream;
 use futures_util::{SinkExt, StreamExt};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -426,11 +426,8 @@ async fn response_from_upstream(
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let response_content_encoding = upstream_resp
-        .headers()
-        .get(CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
+    let restore_allowed =
+        response_restore_allowed(response_content_type.as_deref(), upstream_resp.headers());
     for (name, value) in upstream_resp.headers() {
         if let (Ok(n), Ok(v)) = (
             HeaderName::from_bytes(name.as_ref()),
@@ -455,38 +452,32 @@ async fn response_from_upstream(
         })
     });
     let stream: ResponseByteStream = Box::pin(stream);
-    let restore_allowed = response_restore_allowed(
-        response_content_type.as_deref(),
-        response_content_encoding.as_deref(),
-    );
-    let stream: ResponseByteStream =
-        if restore_allowed && stateful_restore_enabled(&redaction_context) {
-            debug!(
-                request_id = %request_id,
-                mode,
-                placeholder_count_empty = redaction_context.is_empty(),
-                "Response placeholder restoration enabled"
-            );
-            let mime = response_content_type.as_deref().map(media_type);
-            let restore = match mime.as_deref() {
-                Some("text/event-stream") => StreamingRestore::for_sse(redaction_context),
-                Some(mime) if is_json_media_type(mime) || mime == "application/x-ndjson" => {
-                    StreamingRestore::with_json_strings(redaction_context, true)
-                }
-                _ => StreamingRestore::new(redaction_context),
-            };
-            Box::pin(restore_response_stream(stream, restore))
-        } else {
-            debug!(
-                request_id = %request_id,
-                mode,
-                content_type = ?response_content_type,
-                content_encoding = ?response_content_encoding,
-                restore_allowed,
-                "Response placeholder restoration disabled"
-            );
-            stream
+    let stream: ResponseByteStream = if restore_allowed && redaction_context.has_restorable_values()
+    {
+        debug!(
+            request_id = %request_id,
+            mode,
+            "Response placeholder restoration enabled"
+        );
+        let mime = response_content_type.as_deref().map(media_type);
+        let restore = match mime.as_deref() {
+            Some("text/event-stream") => StreamingRestore::for_sse(redaction_context),
+            Some(mime) if is_json_media_type(mime) || mime == "application/x-ndjson" => {
+                StreamingRestore::with_json_strings(redaction_context, true)
+            }
+            _ => StreamingRestore::new(redaction_context),
         };
+        Box::pin(restore_response_stream(stream, restore))
+    } else {
+        debug!(
+            request_id = %request_id,
+            mode,
+            content_type = ?response_content_type,
+            restore_allowed,
+            "Response placeholder restoration disabled"
+        );
+        stream
+    };
     let stream = telemetry_stream(
         stream,
         state,
@@ -502,40 +493,19 @@ async fn response_from_upstream(
     Ok(response)
 }
 
-fn stateful_restore_enabled(context: &RedactionContext) -> bool {
-    !context.is_empty()
-}
-
-fn response_restore_allowed(content_type: Option<&str>, content_encoding: Option<&str>) -> bool {
-    if content_encoding
-        .map(|value| {
-            value.split(',').map(str::trim).any(|encoding| {
-                matches!(
-                    encoding.to_ascii_lowercase().as_str(),
-                    "gzip" | "br" | "zstd" | "deflate"
-                )
-            })
+fn response_restore_allowed(content_type: Option<&str>, headers: &HeaderMap) -> bool {
+    let unencoded = headers.get_all(CONTENT_ENCODING).iter().all(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
         })
-        .unwrap_or(false)
-    {
-        return false;
-    }
-
-    let Some(content_type) = content_type else {
-        return false;
-    };
-    let mime = content_type
-        .split(';')
-        .next()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    mime.starts_with("text/")
-        || mime == "application/json"
-        || mime.ends_with("+json")
-        || mime == "application/x-ndjson"
-        || mime == "text/event-stream"
+    });
+    unencoded
+        && content_type.is_some_and(|value| {
+            let mime = media_type(value);
+            mime.starts_with("text/") || is_json_media_type(&mime) || mime == "application/x-ndjson"
+        })
 }
 
 fn restore_response_stream(
@@ -1152,21 +1122,28 @@ mod tests {
 
     #[test]
     fn response_restore_allows_only_uncompressed_textual_payloads() {
-        assert!(response_restore_allowed(Some("application/json"), None));
-        assert!(response_restore_allowed(Some("text/event-stream"), None));
-        assert!(response_restore_allowed(
-            Some("application/vnd.api+json"),
-            None
-        ));
-        assert!(!response_restore_allowed(
-            Some("application/json"),
-            Some("gzip")
-        ));
+        let mut headers = HeaderMap::new();
+        for mime in [
+            "application/json",
+            "text/event-stream",
+            "application/vnd.api+json",
+        ] {
+            assert!(response_restore_allowed(Some(mime), &headers));
+        }
         assert!(!response_restore_allowed(
             Some("application/octet-stream"),
-            None
+            &headers
         ));
-        assert!(!response_restore_allowed(None, None));
+        assert!(!response_restore_allowed(None, &headers));
+        headers.append(CONTENT_ENCODING, HeaderValue::from_static("Identity"));
+        assert!(response_restore_allowed(Some("text/plain"), &headers));
+        for coding in ["gzip", "custom", "identity, custom"] {
+            let mut encoded = headers.clone();
+            encoded.append(CONTENT_ENCODING, HeaderValue::from_static(coding));
+            assert!(!response_restore_allowed(Some("text/plain"), &encoded));
+        }
+        headers.append(CONTENT_ENCODING, HeaderValue::from_bytes(&[0xff]).unwrap());
+        assert!(!response_restore_allowed(Some("text/plain"), &headers));
     }
 
     #[test]
@@ -2225,7 +2202,7 @@ fn decompress_gzip(body: &[u8], max_body_size: usize) -> Result<Bytes, StatusCod
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let decoder = GzDecoder::new(body);
+    let decoder = MultiGzDecoder::new(body);
     let mut decompressed = Vec::new();
     decoder
         .take(max_body_size.saturating_add(1) as u64)

@@ -1070,10 +1070,17 @@ async fn redaction_captures_decoded_compression_and_rejects_expansion_over_limit
                     CANARY.as_bytes().to_vec()
                 };
                 let compressed = if encoding == "gzip" {
-                    let mut encoder =
-                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-                    encoder.write_all(&body).unwrap();
-                    encoder.finish().unwrap()
+                    // A gzip stream can contain several members forming one HTTP body.
+                    let mut compressed = Vec::new();
+                    for member in body.chunks(body.len().div_ceil(2)) {
+                        let mut encoder = flate2::write::GzEncoder::new(
+                            &mut compressed,
+                            flate2::Compression::fast(),
+                        );
+                        encoder.write_all(member).unwrap();
+                        encoder.finish().unwrap();
+                    }
+                    compressed
                 } else {
                     zstd::stream::encode_all(body.as_slice(), 1).unwrap()
                 };
