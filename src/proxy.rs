@@ -41,8 +41,8 @@ use crate::redaction_context::{RedactionContext, StreamingRestore};
 use crate::redactor::Redactor;
 use crate::telemetry::{
     ContentCaptureRecord, RequestRecord, RequestTelemetryContext, ResponseTelemetryCollector,
-    extract_model_from_json, extract_tool_events_from_json, extract_websocket_text_telemetry,
-    next_request_id, now_ms, telemetry_url,
+    extract_gemini_model_from_url, extract_model_from_json, extract_tool_events_from_json,
+    extract_websocket_text_telemetry, next_request_id, now_ms, telemetry_url,
 };
 use crate::telemetry_store::TelemetryStore;
 
@@ -221,7 +221,8 @@ async fn forward_request(
         Err(status) => return Err(status),
     };
 
-    let model = extract_model_from_json(&processed_body.telemetry_bytes);
+    let model = extract_model_from_json(&processed_body.telemetry_bytes)
+        .or_else(|| extract_gemini_model_from_url(&upstream_url));
     let telemetry_upstream = telemetry_url(&upstream_url).to_owned();
     let telemetry_context = RequestTelemetryContext {
         request_id: request_id.clone(),

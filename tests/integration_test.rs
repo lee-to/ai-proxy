@@ -1092,7 +1092,8 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
     const QUERY: &str = "alt=sse&key=synthetic-test-value";
     const FRAME: &str =
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"fragment\"}]}}]}\n\n";
-    const FINAL_FRAME: &str = "data: {\"modelVersion\":\"gemini-test\",\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":20,\"totalTokenCount\":28}}\n\n";
+    const MODEL_FRAME: &str = "data: {\"modelVersion\":\"gemini-test\"}\n\n";
+    const FINAL_FRAME: &str = "data: {\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":20,\"totalTokenCount\":28}}\n\n";
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_url = format!("http://{}", listener.local_addr().unwrap());
@@ -1102,7 +1103,11 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
             PATH,
             any(move |uri: Uri| async move {
                 assert_eq!(uri.query(), Some(QUERY));
-                let chunks = std::iter::repeat_n(Bytes::from_static(FRAME.as_bytes()), frame_count)
+                let chunks = std::iter::once(Bytes::from_static(MODEL_FRAME.as_bytes()))
+                    .chain(std::iter::repeat_n(
+                        Bytes::from_static(FRAME.as_bytes()),
+                        frame_count,
+                    ))
                     .chain(std::iter::once(Bytes::from_static(FINAL_FRAME.as_bytes())))
                     .map(Ok::<_, std::io::Error>);
                 Response::builder()
@@ -1142,7 +1147,11 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
         .await
         .unwrap();
     let body = response.error_for_status().unwrap().text().await.unwrap();
-    assert_eq!(body.len(), frame_count * FRAME.len() + FINAL_FRAME.len());
+    assert_eq!(
+        body.len(),
+        MODEL_FRAME.len() + frame_count * FRAME.len() + FINAL_FRAME.len()
+    );
+    assert!(body.starts_with(MODEL_FRAME));
     assert!(body.ends_with(FINAL_FRAME));
 
     let expected_upstream = format!("{upstream_url}{PATH}");
@@ -1151,6 +1160,7 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
     assert_eq!(dashboard.by_model[0].name, "gemini-test");
     assert_eq!(dashboard.by_upstream[0].name, expected_upstream);
     let timeline = store.request_timeline_dashboard(24, 10).await.unwrap();
+    assert_eq!(timeline.events[0].model.as_deref(), Some("gemini"));
     assert_eq!(timeline.events[0].path, expected_upstream);
     assert_eq!(timeline.events[0].upstream, expected_upstream);
 }

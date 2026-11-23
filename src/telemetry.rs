@@ -319,6 +319,20 @@ pub(crate) fn telemetry_url(url: &str) -> &str {
     url.split_once(['?', '#']).map_or(url, |(path, _)| path)
 }
 
+pub(crate) fn extract_gemini_model_from_url(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let mut segments = url.path_segments()?.rev();
+    let (model, method) = segments.next()?.rsplit_once(':')?;
+    match (segments.next()?, method) {
+        ("models" | "tunedModels" | "dynamic", "generateContent" | "streamGenerateContent")
+            if !model.is_empty() =>
+        {
+            Some(model.to_owned())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 struct ParsedResponseTelemetry {
     request_id: String,
@@ -371,8 +385,10 @@ impl ParsedResponseTelemetry {
             return;
         }
 
-        if let Some(response) = gemini_response(value) {
-            self.gemini_usage.observe(value, response);
+        let gemini = gemini_response(value);
+        self.gemini_usage.observe_model(value, gemini.is_some());
+        if let Some(response) = gemini {
+            self.gemini_usage.observe_usage(response);
             for (position, candidate) in array_items(response, "candidates").enumerate() {
                 let index = candidate
                     .get("index")
@@ -485,26 +501,19 @@ impl ParsedResponseTelemetry {
     }
 
     fn finish(mut self) -> (Vec<TokenUsageRecord>, Vec<ToolEventRecord>) {
-        let GeminiUsage {
-            model,
-            input_tokens,
-            output_tokens,
-            total_tokens,
-        } = self.gemini_usage;
-        if input_tokens.is_some() || output_tokens.is_some() || total_tokens.is_some() {
-            let total_tokens = total_tokens.unwrap_or_else(|| {
-                input_tokens
-                    .unwrap_or(0)
-                    .saturating_add(output_tokens.unwrap_or(0))
-            });
+        if let Some(total_tokens) = self
+            .gemini_usage
+            .total_tokens
+            .or_else(|| self.gemini_usage.sum())
+        {
             self.usage.push(TokenUsageRecord {
                 request_id: self.request_id,
                 observed_at_ms: now_ms(),
-                model: model.or(self.model),
+                model: self.gemini_usage.model.or(self.model),
                 upstream: self.upstream,
                 source: self.source,
-                input_tokens,
-                output_tokens,
+                input_tokens: self.gemini_usage.input_tokens,
+                output_tokens: self.gemini_usage.output_tokens,
                 total_tokens: Some(total_tokens),
             });
         }
@@ -563,32 +572,88 @@ struct GeminiUsage {
     model: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    thought_tokens: Option<i64>,
+    tool_prompt_tokens: Option<i64>,
     total_tokens: Option<i64>,
 }
 
 impl GeminiUsage {
-    fn observe(&mut self, envelope: &Value, response: &Value) {
-        self.model = gemini_model(response)
-            .or_else(|| self.model.take())
-            .or_else(|| gemini_model(envelope));
+    fn observe_model(&mut self, envelope: &Value, is_gemini_response: bool) {
+        let mut objects = envelope
+            .get("response")
+            .into_iter()
+            .chain(std::iter::once(envelope))
+            .filter_map(Value::as_object);
+        if let Some(version) = objects
+            .clone()
+            .find_map(|object| first_string(object, &["modelVersion", "model_version"]))
+        {
+            self.model = Some(version);
+        } else if self.model.is_none() {
+            self.model = objects
+                .clone()
+                .find_map(|object| first_string(object, &["model_name"]))
+                .or_else(|| {
+                    is_gemini_response
+                        .then(|| objects.find_map(|object| first_string(object, &["model"])))
+                        .flatten()
+                });
+        }
+    }
 
+    fn observe_usage(&mut self, response: &Value) {
         let Some(metadata) = response.get("usageMetadata").and_then(Value::as_object) else {
             return;
         };
-        let input_tokens = first_i64(metadata, &["promptTokenCount"]).or(self.input_tokens);
-        let output_tokens = first_i64(metadata, &["candidatesTokenCount", "outputTokenCount"])
-            .or(self.output_tokens);
-        let total_tokens = first_i64(metadata, &["totalTokenCount"]);
-        // A total from an earlier snapshot can be stale when counters change.
-        if total_tokens.is_some()
-            || input_tokens != self.input_tokens
-            || output_tokens != self.output_tokens
-        {
-            self.total_tokens = total_tokens;
+        let deltas = [
+            update_gemini_counter(
+                &mut self.input_tokens,
+                first_i64(metadata, &["promptTokenCount"]),
+            ),
+            update_gemini_counter(
+                &mut self.output_tokens,
+                first_i64(metadata, &["candidatesTokenCount", "outputTokenCount"]),
+            ),
+            update_gemini_counter(
+                &mut self.thought_tokens,
+                first_i64(metadata, &["thoughtsTokenCount"]),
+            ),
+            update_gemini_counter(
+                &mut self.tool_prompt_tokens,
+                first_i64(metadata, &["toolUsePromptTokenCount"]),
+            ),
+        ];
+
+        if let Some(total) = first_i64(metadata, &["totalTokenCount"]) {
+            self.total_tokens = Some(total);
+        } else if let Some(total) = self.total_tokens {
+            // Carry forward tokens included in Gemini's total even if their counters were omitted.
+            let updated = deltas.into_iter().fold(total, i64::saturating_add);
+            self.total_tokens = Some(updated.max(self.sum().unwrap_or(0)));
         }
-        self.input_tokens = input_tokens;
-        self.output_tokens = output_tokens;
     }
+
+    fn sum(&self) -> Option<i64> {
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.thought_tokens,
+            self.tool_prompt_tokens,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(i64::saturating_add)
+    }
+}
+
+fn update_gemini_counter(counter: &mut Option<i64>, observed: Option<i64>) -> i64 {
+    observed
+        .and_then(|current| {
+            counter
+                .replace(current)
+                .map(|previous| current.saturating_sub(previous))
+        })
+        .unwrap_or(0)
 }
 
 fn gemini_response(value: &Value) -> Option<&Value> {
@@ -658,7 +723,10 @@ fn collect_gemini_request_events(
     // Continuation requests append the current results after the model's last turn.
     let result_start = contents
         .iter()
-        .rposition(|content| gemini_function_responses(content).next().is_none())
+        .rposition(|content| {
+            content.get("role").and_then(Value::as_str) == Some("model")
+                || array_items(content, "parts").any(|part| part.get("functionCall").is_some())
+        })
         .map_or(0, |index| index + 1);
     for tool in contents[result_start..]
         .iter()
@@ -963,8 +1031,89 @@ impl SseTelemetryBuffer {
 }
 
 #[derive(Debug, Default)]
+struct JsonTelemetryBuffer {
+    buffer: TelemetryBuffer,
+    string_start: Option<usize>,
+    escaped: bool,
+    skip_string: bool,
+    payload_key: bool,
+    payload_value: bool,
+}
+
+impl JsonTelemetryBuffer {
+    fn extend(&mut self, bytes: &[u8], telemetry: &ParsedResponseTelemetry, unit: &str) {
+        for &byte in bytes {
+            if self.buffer.oversized {
+                break;
+            }
+            if let Some(start) = self.string_start {
+                if byte == b'"' && !self.escaped {
+                    self.payload_key =
+                        !self.skip_string && is_json_payload_key(&self.buffer.bytes[start..]);
+                    self.string_start = None;
+                    self.skip_string = false;
+                } else {
+                    self.escaped = byte == b'\\' && !self.escaped;
+                }
+                if !self.skip_string {
+                    self.buffer
+                        .extend(std::slice::from_ref(&byte), telemetry, unit);
+                }
+                continue;
+            }
+
+            let offset = self.buffer.bytes.len();
+            self.buffer
+                .extend(std::slice::from_ref(&byte), telemetry, unit);
+            match byte {
+                b'"' => {
+                    self.string_start = Some(offset);
+                    self.skip_string = std::mem::take(&mut self.payload_value);
+                    self.payload_key = false;
+                }
+                b':' => self.payload_value = std::mem::take(&mut self.payload_key),
+                b' ' | b'\r' | b'\n' | b'\t' => {}
+                _ => {
+                    self.payload_key = false;
+                    self.payload_value = false;
+                }
+            }
+        }
+    }
+
+    fn observe(&self, telemetry: &mut ParsedResponseTelemetry) {
+        if !self.buffer.oversized {
+            telemetry.observe_json(&self.buffer.bytes);
+        }
+    }
+
+    fn clear(&mut self) {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.clear();
+        *self = Self {
+            buffer,
+            ..Self::default()
+        };
+    }
+}
+
+fn is_json_payload_key(open_string: &[u8]) -> bool {
+    // Text, inline media, and thought signatures do not contribute telemetry.
+    // Keep their quotes so the surrounding JSON shape is preserved across chunks.
+    const PAYLOAD_KEYS: &[&[u8]] = &[b"text", b"data", b"thoughtSignature", b"thought_signature"];
+    let key = &open_string[1..];
+    if key.len() <= 6 * b"thought_signature".len() && key.contains(&b'\\') {
+        let mut quoted = open_string.to_vec();
+        quoted.push(b'"');
+        return serde_json::from_slice::<String>(&quoted)
+            .is_ok_and(|key| PAYLOAD_KEYS.contains(&key.as_bytes()));
+    }
+    PAYLOAD_KEYS.contains(&key)
+}
+
+#[derive(Debug, Default)]
 struct JsonArrayTelemetryBuffer {
-    item: TelemetryBuffer,
+    item: JsonTelemetryBuffer,
     depth: usize,
     in_string: bool,
     escaped: bool,
@@ -992,9 +1141,7 @@ impl JsonArrayTelemetryBuffer {
                 b',' | b']' if self.depth == 0 => {
                     self.item
                         .extend(&chunk[item_start..index], telemetry, "JSON array item");
-                    if !self.item.oversized {
-                        telemetry.observe_json(&self.item.bytes);
-                    }
+                    self.item.observe(telemetry);
                     self.item.clear();
                     if byte == b']' {
                         self.closed = true;
@@ -1017,7 +1164,7 @@ impl JsonArrayTelemetryBuffer {
 #[derive(Debug)]
 enum ResponseTelemetryBody {
     Pending,
-    Json(TelemetryBuffer),
+    Json(JsonTelemetryBuffer),
     JsonArray(JsonArrayTelemetryBuffer),
     Sse(SseTelemetryBuffer),
 }
@@ -1046,7 +1193,7 @@ impl ResponseTelemetryCollector {
             chunk = chunk.trim_ascii_start();
             self.body = match chunk.first() {
                 None => return,
-                Some(b'{') => ResponseTelemetryBody::Json(TelemetryBuffer::default()),
+                Some(b'{') => ResponseTelemetryBody::Json(JsonTelemetryBuffer::default()),
                 Some(b'[') => {
                     chunk = &chunk[1..];
                     ResponseTelemetryBody::JsonArray(JsonArrayTelemetryBuffer::default())
@@ -1071,7 +1218,7 @@ impl ResponseTelemetryCollector {
         match self.body {
             ResponseTelemetryBody::Pending | ResponseTelemetryBody::JsonArray(_) => {}
             ResponseTelemetryBody::Json(buffer) => {
-                self.telemetry.observe_json(&buffer.bytes);
+                buffer.observe(&mut self.telemetry);
             }
             ResponseTelemetryBody::Sse(mut buffer) => buffer.flush(&mut self.telemetry),
         }
@@ -1203,6 +1350,7 @@ mod tests {
                 {"functionResponse": {"name": "lookup", "id": "new-1"}},
                 {"functionResponse": {"name": "lookup", "id": "new-2"}}
             ]}),
+            serde_json::json!({"role": "user", "parts": [{"text": "Summarize the results"}]}),
         ]);
         let tools =
             extract_tool_events_from_json("req-test", request.to_string().as_bytes(), "request");
@@ -1257,6 +1405,37 @@ mod tests {
         assert_eq!(usage[0].input_tokens, Some(100));
         assert_eq!(usage[0].output_tokens, Some(20));
         assert_eq!(usage[0].total_tokens, Some(120));
+    }
+
+    #[test]
+    fn keeps_gemini_thought_and_tool_prompt_tokens_in_partial_stream_totals() {
+        for initial in [
+            r#"{"promptTokenCount":100,"candidatesTokenCount":5,"thoughtsTokenCount":50,"toolUsePromptTokenCount":10,"totalTokenCount":165}"#,
+            r#"{"promptTokenCount":100,"candidatesTokenCount":5,"totalTokenCount":165}"#,
+        ] {
+            let body = format!(
+                "data: {{\"usageMetadata\":{initial}}}\n\ndata: {{\"usageMetadata\":{{\"candidatesTokenCount\":20}}}}\n\n"
+            );
+            let (usage, _) = extract_response_telemetry(
+                "req-test",
+                None,
+                GEMINI_UPSTREAM,
+                "response",
+                body.as_bytes(),
+            );
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0].input_tokens, Some(100));
+            assert_eq!(usage[0].output_tokens, Some(20));
+            assert_eq!(usage[0].total_tokens, Some(180));
+        }
+    }
+
+    #[test]
+    fn derives_gemini_total_from_all_reported_counters() {
+        let body = br#"{"usageMetadata":{"promptTokenCount":100,"outputTokenCount":20,"thoughtsTokenCount":50,"toolUsePromptTokenCount":10}}"#;
+        let (usage, _) =
+            extract_response_telemetry("req-test", None, GEMINI_UPSTREAM, "response", body);
+        assert_eq!(usage[0].total_tokens, Some(180));
     }
 
     #[test]
@@ -1364,6 +1543,35 @@ mod tests {
     }
 
     #[test]
+    fn keeps_gemini_usage_and_tools_beside_large_inline_media() {
+        let response = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": "A".repeat(MAX_RESPONSE_TELEMETRY_BUFFER_BYTES)}},
+                    {"text": r#"escaped quotes " and delimiters [,]}"#},
+                    {"functionCall": {"id": "call-1", "name": "lookup"}}
+                ]}
+            }],
+            "modelVersion": "gemini-image",
+            "usageMetadata": {"totalTokenCount": 1024}
+        });
+        for body in [response.to_string(), format!("[{response}]")] {
+            let mut collector = response_collector(GEMINI_UPSTREAM);
+            for chunk in body.as_bytes().chunks(17) {
+                collector.observe_chunk(chunk);
+            }
+
+            let (usage, tools) = collector.finalize();
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0].model.as_deref(), Some("gemini-image"));
+            assert_eq!(usage[0].total_tokens, Some(1024));
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].tool_name.as_deref(), Some("lookup"));
+            assert_eq!(tools[0].call_id.as_deref(), Some("call-1"));
+        }
+    }
+
+    #[test]
     fn keeps_gemini_usage_and_tools_from_long_json_arrays() {
         let mut collector = response_collector(GEMINI_UPSTREAM);
         collector.observe_chunk(b" \r\n [");
@@ -1382,9 +1590,9 @@ mod tests {
             }
         }
 
-        collector.observe_chunk(br#"{"candidates":[{"content":{"parts":[{"text":""#);
+        collector.observe_chunk(br#"{"padding":""#);
         collector.observe_chunk(&vec![b'x'; MAX_RESPONSE_TELEMETRY_BUFFER_BYTES]);
-        collector.observe_chunk(br#""}]}}]}, {"modelVersion":"gemini-test","usageMetadata":{"#);
+        collector.observe_chunk(br#""}, {"modelVersion":"gemini-test","usageMetadata":{"#);
         collector.observe_chunk(br#""totalTokenCount":42}}]"#);
 
         let (usage, tools) = collector.finalize();
