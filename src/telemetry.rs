@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 pub const DEFAULT_QUERY_WINDOW_HOURS: u64 = 24;
 pub const MAX_RESPONSE_TELEMETRY_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_TELEMETRY_RECORD_BYTES: usize = 1024 * 1024;
 static LAST_ULID_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -309,7 +310,7 @@ pub fn extract_tool_events_from_json(
     if let Some(request) = gemini_request(&value) {
         collect_gemini_request_events(request, request_id, source, &mut events);
     } else {
-        collect_tool_events(&value, request_id, source, &mut events);
+        collect_tool_events(&value, request_id, source, &mut |event| events.push(event));
     }
     events
 }
@@ -326,6 +327,7 @@ struct ParsedResponseTelemetry {
     source: String,
     usage: Vec<TokenUsageRecord>,
     tools: Vec<ToolEventRecord>,
+    record_budget: ResponseRecordBudget,
     gemini_usage: GeminiUsage,
     gemini_tool_ids: HashSet<(String, String)>,
     gemini_pending_calls: HashMap<u64, ToolEventRecord>,
@@ -346,54 +348,19 @@ impl ParsedResponseTelemetry {
             source,
             usage: Vec::new(),
             tools: Vec::new(),
+            record_budget: ResponseRecordBudget::default(),
             gemini_usage: GeminiUsage::default(),
             gemini_tool_ids: HashSet::new(),
             gemini_pending_calls: HashMap::new(),
         }
     }
 
-    fn observe_sse_event(&mut self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes);
-        let mut lines = text
-            .lines()
-            .filter_map(|line| {
-                line.trim()
-                    .trim_start_matches('\u{feff}')
-                    .strip_prefix("data:")
-            })
-            .map(str::trim);
-        let Some(first) = lines.next() else {
-            return;
+    fn observe_json(&mut self, bytes: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return false;
         };
-        if let Some(second) = lines.next() {
-            let mut data = [first, second].join("\n");
-            for line in lines {
-                data.push('\n');
-                data.push_str(line);
-            }
-            if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                self.observe(&value);
-                return;
-            }
-            // Some upstreams send one JSON object per data line without a blank separator.
-            for line in data.lines() {
-                self.observe_sse_data(line);
-            }
-        } else {
-            self.observe_sse_data(first);
-        }
-    }
-
-    fn observe_sse_data(&mut self, data: &str) {
-        if data.is_empty() || data == "[DONE]" {
-            return;
-        }
-        match serde_json::from_str::<Value>(data) {
-            Ok(value) => self.observe(&value),
-            Err(error) => {
-                debug!(request_id = %self.request_id, source = %self.source, error = %error, "Skipping non-JSON SSE telemetry event");
-            }
-        }
+        self.observe(&value);
+        true
     }
 
     fn observe(&mut self, value: &Value) {
@@ -434,51 +401,87 @@ impl ParsedResponseTelemetry {
             self.model.as_deref(),
             &self.upstream,
             &self.source,
-            &mut self.usage,
+            &mut |record| {
+                if self
+                    .record_budget
+                    .reserve(record.retained_bytes(), &self.request_id)
+                {
+                    self.usage.push(record);
+                }
+            },
         );
-        collect_tool_events(value, &self.request_id, &self.source, &mut self.tools);
+        collect_tool_events(value, &self.request_id, &self.source, &mut |event| {
+            if self
+                .record_budget
+                .reserve(event.retained_bytes(), &self.request_id)
+            {
+                self.tools.push(event);
+            }
+        });
     }
 
     fn observe_gemini_call(&mut self, index: u64, tool: &serde_json::Map<String, Value>) {
-        let event = gemini_tool_event(tool, "tool_call", &self.request_id, &self.source);
+        let mut event = gemini_tool_event(tool, "tool_call", &self.request_id, &self.source);
         let continues = tool.get("willContinue").and_then(Value::as_bool) == Some(true);
-        if let Entry::Occupied(mut entry) = self.gemini_pending_calls.entry(index) {
-            let pending = entry.get_mut();
-            let same_call = match (&event.call_id, &pending.call_id) {
+        let same_call = self
+            .gemini_pending_calls
+            .get(&index)
+            .is_some_and(|pending| match (&event.call_id, &pending.call_id) {
                 (Some(current), Some(previous)) => current == previous,
                 _ => event.tool_name.is_none(),
-            };
-            if same_call {
-                pending.call_id = pending.call_id.take().or(event.call_id);
-                pending.tool_name = pending.tool_name.take().or(event.tool_name);
-                pending.status = event.status.or_else(|| pending.status.take());
-                if !continues {
-                    let completed = entry.remove();
-                    self.push_gemini_tool(completed);
-                }
-                return;
-            }
+            });
+        if same_call && let Some(mut pending) = self.remove_pending_call(index) {
+            pending.call_id = pending.call_id.or(event.call_id);
+            pending.tool_name = pending.tool_name.or(event.tool_name);
+            pending.status = event.status.or(pending.status);
+            event = pending;
         }
 
         if event.tool_name.is_none() {
             return;
         }
         if continues {
-            self.gemini_pending_calls.insert(index, event);
+            self.remove_pending_call(index);
+            if self
+                .record_budget
+                .reserve(pending_call_bytes(&event), &self.request_id)
+            {
+                self.gemini_pending_calls.insert(index, event);
+            }
         } else {
             self.push_gemini_tool(event);
         }
     }
 
+    fn remove_pending_call(&mut self, index: u64) -> Option<ToolEventRecord> {
+        let event = self.gemini_pending_calls.remove(&index)?;
+        self.record_budget.used -= pending_call_bytes(&event);
+        Some(event)
+    }
+
     fn push_gemini_tool(&mut self, event: ToolEventRecord) {
-        if let Some(id) = event.call_id.as_deref().filter(|id| !id.is_empty())
-            && !self
-                .gemini_tool_ids
-                .insert((event.event_kind.clone(), id.to_owned()))
+        let key = event
+            .call_id
+            .as_ref()
+            .map(|id| (event.event_kind.clone(), id.clone()));
+        if key
+            .as_ref()
+            .is_some_and(|key| self.gemini_tool_ids.contains(key))
         {
             return;
         }
-        self.tools.push(event);
+        let key_bytes = key.as_ref().map_or(0, |key| {
+            size_of_val(key) + key.0.capacity() + key.1.capacity()
+        });
+        if self
+            .record_budget
+            .reserve(event.retained_bytes() + key_bytes, &self.request_id)
+        {
+            if let Some(key) = key {
+                self.gemini_tool_ids.insert(key);
+            }
+            self.tools.push(event);
+        }
     }
 
     fn finish(mut self) -> (Vec<TokenUsageRecord>, Vec<ToolEventRecord>) {
@@ -507,6 +510,52 @@ impl ParsedResponseTelemetry {
         }
         (self.usage, self.tools)
     }
+}
+
+#[derive(Debug, Default)]
+struct ResponseRecordBudget {
+    used: usize,
+    warned: bool,
+}
+
+impl ResponseRecordBudget {
+    fn reserve(&mut self, bytes: usize, request_id: &str) -> bool {
+        if bytes <= MAX_RESPONSE_TELEMETRY_RECORD_BYTES - self.used {
+            self.used += bytes;
+            return true;
+        }
+        if !self.warned {
+            self.warned = true;
+            warn!(request_id, "Response telemetry record limit reached");
+        }
+        false
+    }
+}
+
+impl TokenUsageRecord {
+    fn retained_bytes(&self) -> usize {
+        size_of_val(self)
+            + self.request_id.capacity()
+            + self.model.as_ref().map_or(0, String::capacity)
+            + self.upstream.capacity()
+            + self.source.capacity()
+    }
+}
+
+impl ToolEventRecord {
+    fn retained_bytes(&self) -> usize {
+        size_of_val(self)
+            + self.request_id.capacity()
+            + self.event_kind.capacity()
+            + self.tool_name.as_ref().map_or(0, String::capacity)
+            + self.call_id.as_ref().map_or(0, String::capacity)
+            + self.status.as_ref().map_or(0, String::capacity)
+            + self.source.capacity()
+    }
+}
+
+fn pending_call_bytes(event: &ToolEventRecord) -> usize {
+    size_of::<u64>() + event.retained_bytes()
 }
 
 #[derive(Debug, Default)]
@@ -648,7 +697,7 @@ fn collect_usage_records(
     model: Option<&str>,
     upstream: &str,
     source: &str,
-    usage: &mut Vec<TokenUsageRecord>,
+    emit: &mut impl FnMut(TokenUsageRecord),
 ) {
     match value {
         Value::Object(object) => {
@@ -656,16 +705,16 @@ fn collect_usage_records(
             if let Some(record) =
                 usage_record_from_object(request_id, current_model, upstream, source, value)
             {
-                usage.push(record);
+                emit(record);
             }
 
             for child in object.values() {
-                collect_usage_records(child, request_id, current_model, upstream, source, usage);
+                collect_usage_records(child, request_id, current_model, upstream, source, emit);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_usage_records(item, request_id, model, upstream, source, usage);
+                collect_usage_records(item, request_id, model, upstream, source, emit);
             }
         }
         _ => {}
@@ -727,14 +776,14 @@ fn collect_tool_events(
     value: &Value,
     request_id: &str,
     source: &str,
-    events: &mut Vec<ToolEventRecord>,
+    emit: &mut impl FnMut(ToolEventRecord),
 ) {
     match value {
         Value::Object(object) => {
             if let Some(Value::Array(tools)) = object.get("tools") {
                 for tool in tools {
                     if let Some(tool_name) = tool_name_from_value(tool) {
-                        events.push(ToolEventRecord {
+                        emit(ToolEventRecord {
                             request_id: request_id.to_string(),
                             observed_at_ms: now_ms(),
                             event_kind: "tool_definition".to_string(),
@@ -748,7 +797,7 @@ fn collect_tool_events(
             }
 
             if let Some(event_kind) = tool_event_kind(object.get("type").and_then(Value::as_str)) {
-                events.push(ToolEventRecord {
+                emit(ToolEventRecord {
                     request_id: request_id.to_string(),
                     observed_at_ms: now_ms(),
                     event_kind: event_kind.to_string(),
@@ -760,12 +809,12 @@ fn collect_tool_events(
             }
 
             for child in object.values() {
-                collect_tool_events(child, request_id, source, events);
+                collect_tool_events(child, request_id, source, emit);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_tool_events(item, request_id, source, events);
+                collect_tool_events(item, request_id, source, emit);
             }
         }
         _ => {}
@@ -815,50 +864,161 @@ fn first_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Optio
 }
 
 #[derive(Debug, Default)]
-struct SseTelemetryBuffer {
-    event: Vec<u8>,
-    line_has_content: bool,
+struct TelemetryBuffer {
+    bytes: Vec<u8>,
     oversized: bool,
+}
+
+impl TelemetryBuffer {
+    fn extend(&mut self, bytes: &[u8], telemetry: &ParsedResponseTelemetry, unit: &str) {
+        if self.oversized {
+            return;
+        }
+        let remaining = MAX_RESPONSE_TELEMETRY_BUFFER_BYTES - self.bytes.len();
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if bytes.len() > remaining {
+            self.oversized = true;
+            warn!(request_id = %telemetry.request_id, unit, "Response telemetry parse buffer cap reached");
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.oversized = false;
+    }
+}
+
+#[derive(Debug, Default)]
+struct SseTelemetryBuffer {
+    line: TelemetryBuffer,
+    event: Vec<u8>,
 }
 
 impl SseTelemetryBuffer {
     fn observe_chunk(&mut self, chunk: &[u8], telemetry: &mut ParsedResponseTelemetry) {
         for part in chunk.split_inclusive(|byte| *byte == b'\n') {
-            self.line_has_content |= !part.trim_ascii().is_empty();
-            let ends_line = part.ends_with(b"\n");
-            if ends_line && !self.line_has_content {
-                self.flush(telemetry);
-                continue;
-            }
-            if !self.oversized {
-                if part.len() > MAX_RESPONSE_TELEMETRY_BUFFER_BYTES - self.event.len() {
-                    self.event.clear();
-                    self.oversized = true;
-                    warn!(request_id = %telemetry.request_id, "Skipping oversized SSE telemetry event");
-                } else {
-                    self.event.extend_from_slice(part);
-                }
-            }
-            if ends_line {
-                self.line_has_content = false;
+            if let Some(line_end) = part.strip_suffix(b"\n") {
+                self.line.extend(line_end, telemetry, "SSE line");
+                self.finish_line(telemetry);
+            } else {
+                self.line.extend(part, telemetry, "SSE line");
             }
         }
     }
 
-    fn flush(&mut self, telemetry: &mut ParsedResponseTelemetry) {
-        if !self.oversized && !self.event.is_empty() {
-            telemetry.observe_sse_event(&self.event);
+    fn finish_line(&mut self, telemetry: &mut ParsedResponseTelemetry) {
+        if self.line.oversized {
+            self.finish_event(telemetry);
+            self.line.clear();
+            return;
+        }
+        let mut bytes = std::mem::take(&mut self.line.bytes);
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if line.is_empty() {
+            self.finish_event(telemetry);
+        } else if let Some(data) = line.strip_prefix("data:") {
+            self.observe_data(data.trim(), telemetry);
+        }
+        bytes.clear();
+        self.line.bytes = bytes;
+    }
+
+    fn observe_data(&mut self, data: &str, telemetry: &mut ParsedResponseTelemetry) {
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let separator_len = usize::from(!self.event.is_empty());
+        if self.event.len() + separator_len + data.len() > MAX_RESPONSE_TELEMETRY_BUFFER_BYTES {
+            self.finish_event(telemetry);
+        }
+        // A complete JSON data line can be parsed immediately, even without a blank separator.
+        if self.event.is_empty() && telemetry.observe_json(data.as_bytes()) {
+            return;
+        }
+        if !self.event.is_empty() {
+            self.event.push(b'\n');
+        }
+        if data.len() <= MAX_RESPONSE_TELEMETRY_BUFFER_BYTES {
+            self.event.extend_from_slice(data.as_bytes());
+        }
+    }
+
+    fn finish_event(&mut self, telemetry: &mut ParsedResponseTelemetry) {
+        if !self.event.is_empty() && !telemetry.observe_json(&self.event) {
+            for line in self.event.split(|byte| *byte == b'\n') {
+                if !telemetry.observe_json(line) {
+                    debug!(request_id = %telemetry.request_id, source = %telemetry.source, "Skipping non-JSON SSE telemetry data");
+                }
+            }
         }
         self.event.clear();
-        self.line_has_content = false;
-        self.oversized = false;
+    }
+
+    fn flush(&mut self, telemetry: &mut ParsedResponseTelemetry) {
+        self.finish_line(telemetry);
+        self.finish_event(telemetry);
+    }
+}
+
+#[derive(Debug, Default)]
+struct JsonArrayTelemetryBuffer {
+    item: TelemetryBuffer,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    closed: bool,
+}
+
+impl JsonArrayTelemetryBuffer {
+    fn observe_chunk(&mut self, chunk: &[u8], telemetry: &mut ParsedResponseTelemetry) {
+        if self.closed {
+            return;
+        }
+        let mut item_start = 0;
+        for (index, &byte) in chunk.iter().enumerate() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b',' | b']' if self.depth == 0 => {
+                    self.item
+                        .extend(&chunk[item_start..index], telemetry, "JSON array item");
+                    if !self.item.oversized {
+                        telemetry.observe_json(&self.item.bytes);
+                    }
+                    self.item.clear();
+                    if byte == b']' {
+                        self.closed = true;
+                        return;
+                    }
+                    item_start = index + 1;
+                }
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        // Follow delimiters even while discarding an oversized item so later metadata can be read.
+        self.item
+            .extend(&chunk[item_start..], telemetry, "JSON array item");
     }
 }
 
 #[derive(Debug)]
 enum ResponseTelemetryBody {
     Pending,
-    Json { bytes: Vec<u8>, cap_hit: bool },
+    Json(TelemetryBuffer),
+    JsonArray(JsonArrayTelemetryBuffer),
     Sse(SseTelemetryBuffer),
 }
 
@@ -886,30 +1046,22 @@ impl ResponseTelemetryCollector {
             chunk = chunk.trim_ascii_start();
             self.body = match chunk.first() {
                 None => return,
-                Some(b'{' | b'[') => ResponseTelemetryBody::Json {
-                    bytes: Vec::new(),
-                    cap_hit: false,
-                },
+                Some(b'{') => ResponseTelemetryBody::Json(TelemetryBuffer::default()),
+                Some(b'[') => {
+                    chunk = &chunk[1..];
+                    ResponseTelemetryBody::JsonArray(JsonArrayTelemetryBuffer::default())
+                }
                 Some(_) => ResponseTelemetryBody::Sse(SseTelemetryBuffer::default()),
             };
         }
 
         match &mut self.body {
             ResponseTelemetryBody::Pending => {}
-            ResponseTelemetryBody::Json { bytes, cap_hit } => {
-                if *cap_hit {
-                    return;
-                }
-                let remaining = MAX_RESPONSE_TELEMETRY_BUFFER_BYTES - bytes.len();
-                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                if chunk.len() > remaining {
-                    *cap_hit = true;
-                    warn!(
-                        request_id = %self.telemetry.request_id,
-                        cap_bytes = MAX_RESPONSE_TELEMETRY_BUFFER_BYTES,
-                        "Response telemetry parse buffer cap reached"
-                    );
-                }
+            ResponseTelemetryBody::Json(buffer) => {
+                buffer.extend(chunk, &self.telemetry, "JSON body")
+            }
+            ResponseTelemetryBody::JsonArray(buffer) => {
+                buffer.observe_chunk(chunk, &mut self.telemetry)
             }
             ResponseTelemetryBody::Sse(buffer) => buffer.observe_chunk(chunk, &mut self.telemetry),
         }
@@ -917,11 +1069,9 @@ impl ResponseTelemetryCollector {
 
     pub fn finalize(mut self) -> (Vec<TokenUsageRecord>, Vec<ToolEventRecord>) {
         match self.body {
-            ResponseTelemetryBody::Pending => {}
-            ResponseTelemetryBody::Json { bytes, .. } => {
-                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                    self.telemetry.observe(&value);
-                }
+            ResponseTelemetryBody::Pending | ResponseTelemetryBody::JsonArray(_) => {}
+            ResponseTelemetryBody::Json(buffer) => {
+                self.telemetry.observe_json(&buffer.bytes);
             }
             ResponseTelemetryBody::Sse(mut buffer) => buffer.flush(&mut self.telemetry),
         }
@@ -1204,14 +1354,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn keeps_sse_frames_after_an_oversized_event_split_across_chunks() {
-        let mut collector = ResponseTelemetryCollector::new(
+    fn response_collector(upstream: &str) -> ResponseTelemetryCollector {
+        ResponseTelemetryCollector::new(
             "req-test".to_owned(),
             None,
-            GEMINI_UPSTREAM.to_owned(),
+            upstream.to_owned(),
             "response".to_owned(),
+        )
+    }
+
+    #[test]
+    fn keeps_gemini_usage_and_tools_from_long_json_arrays() {
+        let mut collector = response_collector(GEMINI_UPSTREAM);
+        collector.observe_chunk(b" \r\n [");
+        collector.observe_chunk(
+            br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup"}}]}}]},"#,
         );
+
+        let text = r#"quotes \" and delimiters [,]}"#.repeat(40);
+        let item = format!(
+            "{},",
+            serde_json::json!({"candidates": [{"content": {"parts": [{"text": text}]}}]})
+        );
+        for _ in 0..(MAX_RESPONSE_TELEMETRY_BUFFER_BYTES / item.len() + 1) {
+            for part in item.as_bytes().chunks(17) {
+                collector.observe_chunk(part);
+            }
+        }
+
+        collector.observe_chunk(br#"{"candidates":[{"content":{"parts":[{"text":""#);
+        collector.observe_chunk(&vec![b'x'; MAX_RESPONSE_TELEMETRY_BUFFER_BYTES]);
+        collector.observe_chunk(br#""}]}}]}, {"modelVersion":"gemini-test","usageMetadata":{"#);
+        collector.observe_chunk(br#""totalTokenCount":42}}]"#);
+
+        let (usage, tools) = collector.finalize();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].total_tokens, Some(42));
+        assert_eq!(usage[0].model.as_deref(), Some("gemini-test"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_name.as_deref(), Some("lookup"));
+    }
+
+    #[test]
+    fn keeps_individual_sse_data_lines_without_blank_separators() {
+        let mut collector = response_collector("https://api.openai.com/v1/responses");
+        collector.observe_chunk(b"data: {\"usage\":{\"total_tokens\":10}}\n");
+        let text = "x".repeat(1024);
+        let line = format!("data: {{\"text\":\"{text}\"}}\n");
+        for _ in 0..(MAX_RESPONSE_TELEMETRY_BUFFER_BYTES / line.len() + 1) {
+            collector.observe_chunk(line.as_bytes());
+        }
+        collector.observe_chunk(b"data: {\"usage\":{\"total_tokens\":42}}");
+
+        let (usage, _) = collector.finalize();
+        let totals: Vec<_> = usage.iter().map(|row| row.total_tokens).collect();
+        assert_eq!(totals, [Some(10), Some(42)]);
+    }
+
+    #[test]
+    fn bounds_streamed_records_without_losing_final_gemini_usage() {
+        let mut collector = response_collector(GEMINI_UPSTREAM);
+        let metadata = "x".repeat(8 * 1024);
+        for index in 0..256 {
+            let event = serde_json::json!({"candidates": [
+                {"index": index, "content": {"parts": [{"functionCall": {
+                    "name": "pending",
+                    "id": format!("pending-{index}-{metadata}"),
+                    "willContinue": true
+                }}]}},
+                {"content": {"parts": [{"functionCall": {
+                    "name": "completed",
+                    "id": format!("completed-{index}-{metadata}")
+                }}]}}
+            ]});
+            collector.observe_chunk(format!("data: {event}\n\n").as_bytes());
+            let generic_usage =
+                serde_json::json!({"model": metadata, "usage":{"total_tokens": 10}});
+            collector.observe_chunk(format!("data: {generic_usage}\n\n").as_bytes());
+        }
+
+        let telemetry = &collector.telemetry;
+        assert!(telemetry.record_budget.warned);
+        assert!(!telemetry.gemini_pending_calls.is_empty());
+        assert!(telemetry.gemini_pending_calls.len() < 256);
+        assert!(telemetry.gemini_tool_ids.len() < 256);
+        assert_eq!(telemetry.gemini_tool_ids.len(), telemetry.tools.len());
+        assert!(!telemetry.usage.is_empty());
+        assert!(telemetry.usage.len() < 256);
+
+        collector.observe_chunk(b"data: {\"usageMetadata\":{\"totalTokenCount\":42}}\n\n");
+        let (usage, _) = collector.finalize();
+        assert_eq!(usage.last().unwrap().total_tokens, Some(42));
+    }
+
+    #[test]
+    fn keeps_sse_frames_after_an_oversized_event_split_across_chunks() {
+        let mut collector = response_collector(GEMINI_UPSTREAM);
         collector.observe_chunk(b"data: ");
         collector.observe_chunk(&vec![b'x'; MAX_RESPONSE_TELEMETRY_BUFFER_BYTES]);
         collector.observe_chunk(b"\r\n\r");
