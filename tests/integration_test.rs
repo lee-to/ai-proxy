@@ -1146,6 +1146,100 @@ async fn test_proxy_redacts_connection_string_inside_valid_json() {
 }
 
 #[tokio::test]
+async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
+    use ai_proxy::telemetry::MAX_RESPONSE_TELEMETRY_BUFFER_BYTES;
+    use axum::body::Body;
+    use axum::http::Uri;
+    use axum::response::Response;
+
+    const PATH: &str = "/v1beta/models/gemini:streamGenerateContent";
+    const QUERY: &str = "alt=sse&key=synthetic-test-value";
+    const FRAME: &str =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"fragment\"}]}}]}\n\n";
+    const MODEL_FRAME: &str = "data: {\"modelVersion\":\"gemini-test\"}\n\n";
+    let final_response = serde_json::json!({
+        "candidates": [{"content": {"parts": [{
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": "A".repeat(MAX_RESPONSE_TELEMETRY_BUFFER_BYTES)
+            }
+        }]}}],
+        "usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 20, "totalTokenCount": 28}
+    });
+    let final_frame = format!("data: {final_response}\n\n");
+    let upstream_final_frame = Bytes::copy_from_slice(final_frame.as_bytes());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    let frame_count = MAX_RESPONSE_TELEMETRY_BUFFER_BYTES / FRAME.len() + 1;
+    let _upstream_handle = tokio::spawn(async move {
+        let app = Router::new().route(
+            PATH,
+            any(move |uri: Uri| async move {
+                assert_eq!(uri.query(), Some(QUERY));
+                let chunks = std::iter::once(Bytes::from_static(MODEL_FRAME.as_bytes()))
+                    .chain(std::iter::repeat_n(
+                        Bytes::from_static(FRAME.as_bytes()),
+                        frame_count,
+                    ))
+                    .chain(std::iter::once(upstream_final_frame))
+                    .map(Ok::<_, std::io::Error>);
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let store = Arc::new(
+        ai_proxy::telemetry_store::TelemetryStore::open_in_memory(24)
+            .await
+            .unwrap(),
+    );
+    let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (proxy_url, _proxy_handle) = start_proxy_with_custom_client_and_telemetry(
+        &upstream_url,
+        false,
+        "body",
+        http_client.clone(),
+        None,
+        false,
+        vec![],
+        vec![],
+        "inspect",
+        Some(store.clone()),
+    )
+    .await;
+
+    let response = http_client
+        .post(format!("{proxy_url}{PATH}?{QUERY}"))
+        .header("content-type", "application/json")
+        .body(r#"{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}"#)
+        .send()
+        .await
+        .unwrap();
+    let body = response.error_for_status().unwrap().text().await.unwrap();
+    assert_eq!(
+        body.len(),
+        MODEL_FRAME.len() + frame_count * FRAME.len() + final_frame.len()
+    );
+    assert!(body.starts_with(MODEL_FRAME));
+    assert!(body.ends_with(&final_frame));
+
+    let expected_upstream = format!("{upstream_url}{PATH}");
+    let dashboard = store.usage_dashboard(24).await.unwrap();
+    assert_eq!(dashboard.totals.total_tokens, 28);
+    assert_eq!(dashboard.by_model[0].name, "gemini-test");
+    assert_eq!(dashboard.by_upstream[0].name, expected_upstream);
+    let timeline = store.request_timeline_dashboard(24, 10).await.unwrap();
+    assert_eq!(timeline.events[0].model.as_deref(), Some("gemini"));
+    assert_eq!(timeline.events[0].path, PATH);
+    assert_eq!(timeline.events[0].upstream, expected_upstream);
+}
+
+#[tokio::test]
 async fn test_proxy_redacts_anthropic_key() {
     let (upstream_url, _upstream_handle) = start_mock_upstream().await;
     let (proxy_url, _proxy_handle) = start_proxy(&upstream_url).await;

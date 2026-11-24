@@ -46,8 +46,8 @@ use crate::redaction_context::{RedactionContext, StreamingRestore};
 use crate::redactor::Redactor;
 use crate::telemetry::{
     ContentCaptureRecord, RequestRecord, RequestTelemetryContext, ResponseTelemetryCollector,
-    extract_model_from_json, extract_tool_events_from_json, extract_websocket_text_telemetry,
-    next_request_id, now_ms,
+    extract_gemini_model_from_url, extract_model_from_json, extract_tool_events_from_json,
+    extract_websocket_text_telemetry, next_request_id, now_ms, telemetry_url,
 };
 use crate::telemetry_store::TelemetryStore;
 
@@ -313,7 +313,8 @@ async fn forward_request(
         inspect.await?
     };
 
-    let model = extract_model_from_json(&processed_body.telemetry_bytes);
+    let model = extract_model_from_json(&processed_body.telemetry_bytes)
+        .or_else(|| extract_gemini_model_from_url(&upstream_url));
     let safe_upstream_url = telemetry_url(&upstream_url);
     let telemetry_context = RequestTelemetryContext {
         request_id: request_id.clone(),
@@ -2415,18 +2416,6 @@ fn percent_decode_query_component(value: &str) -> String {
         .next()
         .map(|(_, value)| value.into_owned())
         .unwrap_or_default()
-}
-
-/// Keep connection metadata separate from query parameters and credentials.
-fn telemetry_url(url: &str) -> String {
-    let Ok(mut url) = Url::parse(url) else {
-        return String::new();
-    };
-    url.set_query(None);
-    url.set_fragment(None);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.into()
 }
 
 /// Build the full upstream URL from base URL and request URI.
