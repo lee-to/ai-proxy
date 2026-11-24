@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -315,8 +315,16 @@ pub fn extract_tool_events_from_json(
     events
 }
 
-pub(crate) fn telemetry_url(url: &str) -> &str {
-    url.split_once(['?', '#']).map_or(url, |(path, _)| path)
+/// Keep connection metadata separate from query parameters and credentials.
+pub(crate) fn telemetry_url(url: &str) -> String {
+    let Ok(mut url) = url::Url::parse(url) else {
+        return String::new();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.into()
 }
 
 pub(crate) fn extract_gemini_model_from_url(url: &str) -> Option<String> {
@@ -333,6 +341,8 @@ pub(crate) fn extract_gemini_model_from_url(url: &str) -> Option<String> {
     }
 }
 
+type GeminiCallKey = (u64, Option<String>);
+
 #[derive(Debug)]
 struct ParsedResponseTelemetry {
     request_id: String,
@@ -344,28 +354,22 @@ struct ParsedResponseTelemetry {
     record_budget: ResponseRecordBudget,
     gemini_usage: GeminiUsage,
     gemini_tool_ids: HashSet<(String, String)>,
-    gemini_pending_calls: HashMap<u64, ToolEventRecord>,
+    gemini_pending_calls: BTreeMap<GeminiCallKey, ToolEventRecord>,
 }
 
 impl ParsedResponseTelemetry {
-    fn new(
-        request_id: String,
-        model: Option<String>,
-        mut upstream: String,
-        source: String,
-    ) -> Self {
-        upstream.truncate(telemetry_url(&upstream).len());
+    fn new(request_id: String, model: Option<String>, upstream: String, source: String) -> Self {
         Self {
             request_id,
             model,
-            upstream,
+            upstream: telemetry_url(&upstream),
             source,
             usage: Vec::new(),
             tools: Vec::new(),
             record_budget: ResponseRecordBudget::default(),
             gemini_usage: GeminiUsage::default(),
             gemini_tool_ids: HashSet::new(),
-            gemini_pending_calls: HashMap::new(),
+            gemini_pending_calls: BTreeMap::new(),
         }
     }
 
@@ -439,40 +443,62 @@ impl ParsedResponseTelemetry {
     fn observe_gemini_call(&mut self, index: u64, tool: &serde_json::Map<String, Value>) {
         let mut event = gemini_tool_event(tool, "tool_call", &self.request_id, &self.source);
         let continues = tool.get("willContinue").and_then(Value::as_bool) == Some(true);
-        let same_call = self
-            .gemini_pending_calls
-            .get(&index)
-            .is_some_and(|pending| match (&event.call_id, &pending.call_id) {
-                (Some(current), Some(previous)) => current == previous,
-                _ => event.tool_name.is_none(),
-            });
-        if same_call && let Some(mut pending) = self.remove_pending_call(index) {
-            pending.call_id = pending.call_id.or(event.call_id);
-            pending.tool_name = pending.tool_name.or(event.tool_name);
-            pending.status = event.status.or(pending.status);
-            event = pending;
+        let mut key = (index, event.call_id.take());
+        let pending = match (key.1.is_some(), event.tool_name.is_none()) {
+            (true, true) => self
+                .remove_pending_call(&key)
+                .or_else(|| self.remove_pending_call(&(index, None))),
+            (true, false) => self.remove_pending_call(&key),
+            (false, true) => {
+                // An unnamed fragment without an ID can only be matched unambiguously
+                // when there is a single pending call for this candidate.
+                let mut keys = self
+                    .gemini_pending_calls
+                    .range((index, None)..)
+                    .map(|(key, _)| key)
+                    .take_while(|(candidate, _)| *candidate == index);
+                match (keys.next(), keys.next()) {
+                    (Some(only), None) => self.remove_pending_call(&only.clone()),
+                    _ => None,
+                }
+            }
+            (false, false) => {
+                if continues {
+                    self.remove_pending_call(&key);
+                }
+                None
+            }
+        };
+        if let Some(((_, pending_id), pending)) = pending {
+            key.1 = key.1.or(pending_id);
+            event.tool_name = pending.tool_name.or(event.tool_name);
+            event.status = event.status.or(pending.status);
+            event.observed_at_ms = pending.observed_at_ms;
         }
 
         if event.tool_name.is_none() {
             return;
         }
         if continues {
-            self.remove_pending_call(index);
             if self
                 .record_budget
-                .reserve(pending_call_bytes(&event), &self.request_id)
+                .reserve(pending_call_bytes(&key, &event), &self.request_id)
             {
-                self.gemini_pending_calls.insert(index, event);
+                self.gemini_pending_calls.insert(key, event);
             }
         } else {
+            event.call_id = key.1;
             self.push_gemini_tool(event);
         }
     }
 
-    fn remove_pending_call(&mut self, index: u64) -> Option<ToolEventRecord> {
-        let event = self.gemini_pending_calls.remove(&index)?;
-        self.record_budget.used -= pending_call_bytes(&event);
-        Some(event)
+    fn remove_pending_call(
+        &mut self,
+        key: &GeminiCallKey,
+    ) -> Option<(GeminiCallKey, ToolEventRecord)> {
+        let (key, event) = self.gemini_pending_calls.remove_entry(key)?;
+        self.record_budget.used -= pending_call_bytes(&key, &event);
+        Some((key, event))
     }
 
     fn push_gemini_tool(&mut self, event: ToolEventRecord) {
@@ -563,8 +589,8 @@ impl ToolEventRecord {
     }
 }
 
-fn pending_call_bytes(event: &ToolEventRecord) -> usize {
-    size_of::<u64>() + event.retained_bytes()
+fn pending_call_bytes(key: &GeminiCallKey, event: &ToolEventRecord) -> usize {
+    size_of_val(key) + key.1.as_ref().map_or(0, String::capacity) + event.retained_bytes()
 }
 
 #[derive(Debug, Default)]
@@ -959,69 +985,96 @@ impl TelemetryBuffer {
 
 #[derive(Debug, Default)]
 struct SseTelemetryBuffer {
-    line: TelemetryBuffer,
-    event: Vec<u8>,
+    line: SseTelemetryLine,
+    event: JsonTelemetryBuffer,
+    multiline: bool,
+}
+
+#[derive(Debug, Default)]
+enum SseTelemetryLine {
+    #[default]
+    Start,
+    Prefix(&'static [u8]),
+    Data,
+    Other,
 }
 
 impl SseTelemetryBuffer {
     fn observe_chunk(&mut self, chunk: &[u8], telemetry: &mut ParsedResponseTelemetry) {
         for part in chunk.split_inclusive(|byte| *byte == b'\n') {
             if let Some(line_end) = part.strip_suffix(b"\n") {
-                self.line.extend(line_end, telemetry, "SSE line");
+                self.observe_line_chunk(line_end, telemetry);
                 self.finish_line(telemetry);
             } else {
-                self.line.extend(part, telemetry, "SSE line");
+                self.observe_line_chunk(part, telemetry);
             }
+        }
+    }
+
+    fn observe_line_chunk(&mut self, mut bytes: &[u8], telemetry: &ParsedResponseTelemetry) {
+        while let Some((&byte, rest)) = bytes.split_first() {
+            self.line = match self.line {
+                SseTelemetryLine::Start if byte.is_ascii_whitespace() => SseTelemetryLine::Start,
+                SseTelemetryLine::Start if byte == b'd' => SseTelemetryLine::Prefix(b"ata:"),
+                SseTelemetryLine::Start if byte == 0xef => {
+                    SseTelemetryLine::Prefix(b"\xbb\xbfdata:")
+                }
+                SseTelemetryLine::Prefix([expected, remaining @ ..]) if byte == *expected => {
+                    if remaining.is_empty() {
+                        SseTelemetryLine::Data
+                    } else {
+                        SseTelemetryLine::Prefix(remaining)
+                    }
+                }
+                SseTelemetryLine::Data => {
+                    // Compact JSON before applying the event cap, including when a
+                    // payload field spans multiple network chunks or data lines.
+                    self.event.extend(bytes, telemetry, "SSE event");
+                    return;
+                }
+                _ => {
+                    self.line = SseTelemetryLine::Other;
+                    return;
+                }
+            };
+            bytes = rest;
         }
     }
 
     fn finish_line(&mut self, telemetry: &mut ParsedResponseTelemetry) {
-        if self.line.oversized {
-            self.finish_event(telemetry);
-            self.line.clear();
-            return;
-        }
-        let mut bytes = std::mem::take(&mut self.line.bytes);
-        let line = String::from_utf8_lossy(&bytes);
-        let line = line.trim().trim_start_matches('\u{feff}');
-        if line.is_empty() {
-            self.finish_event(telemetry);
-        } else if let Some(data) = line.strip_prefix("data:") {
-            self.observe_data(data.trim(), telemetry);
-        }
-        bytes.clear();
-        self.line.bytes = bytes;
-    }
-
-    fn observe_data(&mut self, data: &str, telemetry: &mut ParsedResponseTelemetry) {
-        if data.is_empty() || data == "[DONE]" {
-            return;
-        }
-        let separator_len = usize::from(!self.event.is_empty());
-        if self.event.len() + separator_len + data.len() > MAX_RESPONSE_TELEMETRY_BUFFER_BYTES {
-            self.finish_event(telemetry);
-        }
-        // A complete JSON data line can be parsed immediately, even without a blank separator.
-        if self.event.is_empty() && telemetry.observe_json(data.as_bytes()) {
-            return;
-        }
-        if !self.event.is_empty() {
-            self.event.push(b'\n');
-        }
-        if data.len() <= MAX_RESPONSE_TELEMETRY_BUFFER_BYTES {
-            self.event.extend_from_slice(data.as_bytes());
+        match std::mem::take(&mut self.line) {
+            SseTelemetryLine::Start => self.finish_event(telemetry),
+            SseTelemetryLine::Data => {
+                // A complete JSON data line can be parsed even without a blank separator.
+                let standalone = !self.multiline
+                    && (matches!(self.event.buffer.bytes.trim_ascii(), b"" | b"[DONE]")
+                        || self.event.observe(telemetry));
+                if standalone || self.event.buffer.oversized {
+                    self.clear_event();
+                } else {
+                    self.event.extend(b"\n", telemetry, "SSE event");
+                    self.multiline = true;
+                }
+            }
+            SseTelemetryLine::Prefix(_) | SseTelemetryLine::Other => {}
         }
     }
 
     fn finish_event(&mut self, telemetry: &mut ParsedResponseTelemetry) {
-        if !self.event.is_empty() && !telemetry.observe_json(&self.event) {
-            for line in self.event.split(|byte| *byte == b'\n') {
-                if !telemetry.observe_json(line) {
+        let buffer = &self.event.buffer;
+        if !buffer.oversized && !buffer.bytes.is_empty() && !self.event.observe(telemetry) {
+            for line in buffer.bytes.split(|byte| *byte == b'\n') {
+                if !line.trim_ascii().is_empty() && !telemetry.observe_json(line) {
                     debug!(request_id = %telemetry.request_id, source = %telemetry.source, "Skipping non-JSON SSE telemetry data");
                 }
             }
         }
+        self.clear_event();
+    }
+
+    fn clear_event(&mut self) {
         self.event.clear();
+        self.multiline = false;
     }
 
     fn flush(&mut self, telemetry: &mut ParsedResponseTelemetry) {
@@ -1081,10 +1134,8 @@ impl JsonTelemetryBuffer {
         }
     }
 
-    fn observe(&self, telemetry: &mut ParsedResponseTelemetry) {
-        if !self.buffer.oversized {
-            telemetry.observe_json(&self.buffer.bytes);
-        }
+    fn observe(&self, telemetry: &mut ParsedResponseTelemetry) -> bool {
+        !self.buffer.oversized && telemetry.observe_json(&self.buffer.bytes)
     }
 
     fn clear(&mut self) {
@@ -1533,6 +1584,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completes_parallel_gemini_calls_by_id_within_one_candidate() {
+        let body = concat!(
+            r#"data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"name":"lookup","id":"a","willContinue":true}},{"functionCall":{"name":"format","id":"b","willContinue":true}}]}}]}"#,
+            "\n\n",
+            r#"data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"id":"a","partialArgs":[{"jsonPath":"$.query","stringValue":"part"}],"willContinue":true}},{"functionCall":{"id":"b"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"id":"a"}}]}}]}"#,
+            "\n\n",
+        );
+        let (_, tools) = extract_response_telemetry(
+            "req-test",
+            None,
+            GEMINI_UPSTREAM,
+            "response",
+            body.as_bytes(),
+        );
+
+        let calls: Vec<_> = tools
+            .iter()
+            .map(|tool| (tool.tool_name.as_deref(), tool.call_id.as_deref()))
+            .collect();
+        assert_eq!(
+            calls,
+            [(Some("format"), Some("b")), (Some("lookup"), Some("a"))]
+        );
+    }
+
     fn response_collector(upstream: &str) -> ResponseTelemetryCollector {
         ResponseTelemetryCollector::new(
             "req-test".to_owned(),
@@ -1555,7 +1634,14 @@ mod tests {
             "modelVersion": "gemini-image",
             "usageMetadata": {"totalTokenCount": 1024}
         });
-        for body in [response.to_string(), format!("[{response}]")] {
+        let json = response.to_string();
+        let multiline = json.replacen("\"data\":", "\"data\"\r\ndata: :", 1);
+        for body in [
+            json,
+            format!("[{response}]"),
+            format!("data: {response}\n\n"),
+            format!("\u{feff}data: {multiline}\r\n\r\n"),
+        ] {
             let mut collector = response_collector(GEMINI_UPSTREAM);
             for chunk in body.as_bytes().chunks(17) {
                 collector.observe_chunk(chunk);

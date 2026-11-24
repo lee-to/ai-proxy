@@ -188,6 +188,15 @@ impl SecretScanner for ModelScanner {
     }
 
     fn scan_report(&self, text: &str) -> ScanReport {
+        self.scan_before(text, None, None)
+    }
+
+    fn scan_before(
+        &self,
+        text: &str,
+        _field: Option<&str>,
+        deadline: Option<std::time::Instant>,
+    ) -> ScanReport {
         if text.is_empty() {
             return ScanReport::default();
         }
@@ -196,8 +205,16 @@ impl SecretScanner for ModelScanner {
         let text = text.to_string();
         let fallback_text = text.clone();
         let (sender, receiver) = mpsc::channel();
+        let per_call_deadline =
+            std::time::Instant::now() + Duration::from_millis(self.config.timeout_ms);
+        let deadline = deadline.map_or(per_call_deadline, |deadline| {
+            deadline.min(per_call_deadline)
+        });
         model_scanner_runtime().spawn(async move {
-            let _ = sender.send(scanner.scan_async(&text).await);
+            let result = tokio::time::timeout_at(deadline.into(), scanner.scan_async(&text))
+                .await
+                .unwrap_or_else(|_| Err("scanner_timeout".to_string()));
+            let _ = sender.send(result);
         });
         let result = receiver
             .recv()

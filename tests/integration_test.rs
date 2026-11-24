@@ -82,10 +82,12 @@ async fn start_sse_upstream() -> (String, tokio::task::JoinHandle<()>) {
     (url, handle)
 }
 
-async fn start_sse_placeholder_upstream() -> (String, tokio::task::JoinHandle<()>) {
+async fn start_sse_placeholder_upstream(
+    release: Arc<tokio::sync::Notify>,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::body::Body;
     use axum::response::Response;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -94,16 +96,23 @@ async fn start_sse_placeholder_upstream() -> (String, tokio::task::JoinHandle<()
     let handle = tokio::spawn(async move {
         let app = Router::new().route(
             "/{*path}",
-            any(|| async {
-                let chunks = vec![
-                    Ok::<_, std::io::Error>(Bytes::from("data: hello [EMA")),
-                    Ok(Bytes::from("IL_1]\n\n")),
-                ];
-                let body = Body::from_stream(stream::iter(chunks));
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(body)
-                    .unwrap()
+            any(move || {
+                let release = release.clone();
+                async move {
+                    let heartbeat = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                        b": keep-alive\n",
+                    ))]);
+                    let first_data = stream::once(async move {
+                        release.notified().await;
+                        Ok(Bytes::from_static(b"data: hello [EMA"))
+                    });
+                    let tail = stream::iter([Ok(Bytes::from_static(b"IL_1]\n\n"))]);
+                    let body = Body::from_stream(heartbeat.chain(first_data).chain(tail));
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
             }),
         );
         axum::serve(listener, app).await.unwrap();
@@ -803,7 +812,7 @@ async fn start_proxy_with_custom_client_redaction_and_telemetry(
     use ai_proxy::middleware::ScanPipeline;
     use ai_proxy::middleware::regex_scanner::RegexScanner;
     use ai_proxy::middleware::structural_scanner::StructuralScanner;
-    use ai_proxy::proxy::{AppState, proxy_handler};
+    use ai_proxy::proxy::{AppState, ProxyRateLimits, proxy_handler};
     use ai_proxy::redactor::Redactor;
 
     let config = Config {
@@ -842,6 +851,8 @@ async fn start_proxy_with_custom_client_redaction_and_telemetry(
         scanner: ScannerConfig {
             enabled: scanner_enabled,
             scan_scope: scan_scope.to_string(),
+            uninspectable_body_policy: UninspectableBodyPolicy::Forward,
+            request_scan_timeout_ms: 5000,
             header_whitelist: vec!["authorization".to_string()],
             model: ModelScannerConfig::default(),
             privacy_filter: PrivacyFilterScannerConfig::default(),
@@ -888,6 +899,7 @@ async fn start_proxy_with_custom_client_redaction_and_telemetry(
     let redactor = Redactor::new(&config.redaction);
 
     let state = Arc::new(AppState {
+        rate_limits: ProxyRateLimits::new(&config.proxy),
         config,
         pipeline,
         redactor,
@@ -1008,19 +1020,30 @@ async fn test_proxy_full_scan_restores_header_and_query_placeholders() {
 }
 
 #[tokio::test]
-async fn test_proxy_restores_split_sse_placeholder() {
-    let (upstream_url, _upstream_handle) = start_sse_placeholder_upstream().await;
+async fn test_proxy_streams_heartbeat_before_restoring_split_sse_placeholder() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (upstream_url, _upstream_handle) = start_sse_placeholder_upstream(release.clone()).await;
     let (proxy_url, _proxy_handle) =
         start_proxy_with_placeholder_restore(&upstream_url, "body").await;
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let response = client
+    let request = client
         .post(format!("{}/v1/messages", proxy_url))
         .header("content-type", "application/json")
-        .body(r#"{"email":"ada@example.com"}"#)
-        .send()
-        .await
-        .unwrap();
+        .body(r#"{"email":"ada@example.com"}"#);
+    // The upstream sends its first data event only after the client sees the heartbeat.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut response = request.send().await.unwrap();
+        let mut prefix = Vec::new();
+        while prefix.len() < b": keep-alive\n".len() {
+            prefix.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+        }
+        assert_eq!(prefix, b": keep-alive\n");
+        response
+    })
+    .await
+    .expect("heartbeat buffered by proxy");
+    release.notify_one();
 
     let body = response.text().await.unwrap();
     assert!(
@@ -1061,7 +1084,7 @@ async fn test_proxy_persists_usage_without_changing_response() {
 
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let response = client
-        .post(format!("{}/v1/responses", proxy_url))
+        .post(format!("{}/v1/responses?request_label=example", proxy_url))
         .header("content-type", "application/json")
         .body(r#"{"model":"gpt-test","input":"hello"}"#)
         .send()
@@ -1079,6 +1102,47 @@ async fn test_proxy_persists_usage_without_changing_response() {
     assert_eq!(dashboard.totals.output_tokens, 11);
     assert_eq!(dashboard.totals.total_tokens, 18);
     assert_eq!(dashboard.totals.request_count, 1);
+    let timeline = telemetry_store
+        .request_timeline_dashboard(24, 10)
+        .await
+        .unwrap();
+    assert_eq!(timeline.events[0].path, "/v1/responses");
+    assert_eq!(
+        timeline.events[0].upstream,
+        format!("{upstream_url}/v1/responses")
+    );
+}
+
+#[tokio::test]
+async fn test_proxy_redacts_connection_string_inside_valid_json() {
+    let (upstream_url, _upstream_handle) = start_json_echo_upstream().await;
+    let (proxy_url, _proxy_handle) = start_proxy(&upstream_url).await;
+    let mut payload = serde_json::json!({
+        "model": "claude-test",
+        "messages": [
+            {"role": "user", "content": "Open postgresql://localhost/catalog"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_example", "name": "get_schema", "input": {}}
+            ]}
+        ],
+        "max_tokens": 64
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{proxy_url}/v1/messages"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    payload["messages"][0]["content"] = "Open pos***...***log".into();
+    assert_eq!(response, payload);
 }
 
 #[tokio::test]
@@ -1093,7 +1157,17 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
     const FRAME: &str =
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"fragment\"}]}}]}\n\n";
     const MODEL_FRAME: &str = "data: {\"modelVersion\":\"gemini-test\"}\n\n";
-    const FINAL_FRAME: &str = "data: {\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":20,\"totalTokenCount\":28}}\n\n";
+    let final_response = serde_json::json!({
+        "candidates": [{"content": {"parts": [{
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": "A".repeat(MAX_RESPONSE_TELEMETRY_BUFFER_BYTES)
+            }
+        }]}}],
+        "usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 20, "totalTokenCount": 28}
+    });
+    let final_frame = format!("data: {final_response}\n\n");
+    let upstream_final_frame = Bytes::copy_from_slice(final_frame.as_bytes());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_url = format!("http://{}", listener.local_addr().unwrap());
@@ -1108,7 +1182,7 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
                         Bytes::from_static(FRAME.as_bytes()),
                         frame_count,
                     ))
-                    .chain(std::iter::once(Bytes::from_static(FINAL_FRAME.as_bytes())))
+                    .chain(std::iter::once(upstream_final_frame))
                     .map(Ok::<_, std::io::Error>);
                 Response::builder()
                     .header("content-type", "text/event-stream")
@@ -1149,10 +1223,10 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
     let body = response.error_for_status().unwrap().text().await.unwrap();
     assert_eq!(
         body.len(),
-        MODEL_FRAME.len() + frame_count * FRAME.len() + FINAL_FRAME.len()
+        MODEL_FRAME.len() + frame_count * FRAME.len() + final_frame.len()
     );
     assert!(body.starts_with(MODEL_FRAME));
-    assert!(body.ends_with(FINAL_FRAME));
+    assert!(body.ends_with(&final_frame));
 
     let expected_upstream = format!("{upstream_url}{PATH}");
     let dashboard = store.usage_dashboard(24).await.unwrap();
@@ -1161,7 +1235,7 @@ async fn test_proxy_records_final_gemini_usage_without_the_api_key() {
     assert_eq!(dashboard.by_upstream[0].name, expected_upstream);
     let timeline = store.request_timeline_dashboard(24, 10).await.unwrap();
     assert_eq!(timeline.events[0].model.as_deref(), Some("gemini"));
-    assert_eq!(timeline.events[0].path, expected_upstream);
+    assert_eq!(timeline.events[0].path, PATH);
     assert_eq!(timeline.events[0].upstream, expected_upstream);
 }
 
@@ -1441,7 +1515,6 @@ async fn test_mitm_connect_redacts_https_body() {
 
 #[tokio::test]
 async fn test_mitm_codex_responses_routes_to_subscription_url() {
-    let (target_addr, _target_handle) = start_tls_echo_upstream().await;
     let (subscription_url, _subscription_handle) = start_query_echo_upstream().await;
     let (cert_path, key_path, ca_cert) = write_temp_mitm_ca();
     let (proxy_url, _proxy_handle) =
@@ -1455,7 +1528,7 @@ async fn test_mitm_codex_responses_routes_to_subscription_url() {
         .unwrap();
 
     let response = client
-        .post(format!("https://{target_addr}/v1/responses?foo=bar"))
+        .post("https://chatgpt.com/backend-api/codex/responses?foo=bar")
         .header("authorization", "Bearer opaque-subscription-token")
         .body(r#"{"model":"gpt-5","input":"hello"}"#)
         .send()
@@ -1468,7 +1541,6 @@ async fn test_mitm_codex_responses_routes_to_subscription_url() {
 
 #[tokio::test]
 async fn test_mitm_rejects_websocket_upgrade_for_codex_fallback() {
-    let (target_addr, _target_handle) = start_tls_echo_upstream().await;
     let (subscription_url, _subscription_handle) = start_query_echo_upstream().await;
     let (cert_path, key_path, ca_cert) = write_temp_mitm_ca();
     let (proxy_url, _proxy_handle) = start_mitm_proxy_with_websocket_mode(
@@ -1489,7 +1561,7 @@ async fn test_mitm_rejects_websocket_upgrade_for_codex_fallback() {
         .unwrap();
 
     let response = client
-        .get(format!("https://{target_addr}/v1/responses"))
+        .get("https://chatgpt.com/backend-api/codex/responses")
         .header("authorization", "Bearer opaque-subscription-token")
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
@@ -1515,7 +1587,7 @@ async fn test_mitm_proxies_websocket_upgrade_and_redacts_text_frames() {
         start_mitm_proxy_with_options(&subscription_url, true, "body", cert_path, key_path, vec![])
             .await;
     let proxy_addr = proxy_url.trim_start_matches("http://");
-    let target_authority = "localhost:443";
+    let target_authority = "chatgpt.com:443";
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream
@@ -1547,10 +1619,10 @@ async fn test_mitm_proxies_websocket_upgrade_and_redacts_text_frames() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("chatgpt.com").unwrap();
     let tls_stream = connector.connect(server_name, stream).await.unwrap();
 
-    let mut request = "wss://localhost/v1/responses"
+    let mut request = "wss://chatgpt.com/backend-api/codex/responses"
         .into_client_request()
         .unwrap();
     request.headers_mut().insert(
@@ -1620,7 +1692,7 @@ async fn test_mitm_websocket_persists_codex_usage() {
     )
     .await;
     let proxy_addr = proxy_url.trim_start_matches("http://");
-    let target_authority = "localhost:443";
+    let target_authority = "chatgpt.com:443";
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream
@@ -1647,10 +1719,10 @@ async fn test_mitm_websocket_persists_codex_usage() {
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("chatgpt.com").unwrap();
     let tls_stream = connector.connect(server_name, stream).await.unwrap();
 
-    let mut request = "wss://localhost/v1/responses"
+    let mut request = "wss://chatgpt.com/backend-api/codex/responses"
         .into_client_request()
         .unwrap();
     request.headers_mut().insert(
@@ -1673,7 +1745,18 @@ async fn test_mitm_websocket_persists_codex_usage() {
             .contains("response.completed")
     );
 
-    let dashboard = telemetry_store.usage_dashboard(24).await.unwrap();
+    // Usage is recorded asynchronously from the WebSocket forwarding task.
+    let dashboard = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let dashboard = telemetry_store.usage_dashboard(24).await.unwrap();
+            if dashboard.totals.total_tokens != 0 {
+                break dashboard;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("WebSocket telemetry should be recorded");
     assert_eq!(dashboard.totals.input_tokens, 21);
     assert_eq!(dashboard.totals.output_tokens, 34);
     assert_eq!(dashboard.totals.total_tokens, 55);
@@ -1878,7 +1961,7 @@ async fn test_codex_responses_routes_to_codex_upstream() {
 }
 
 #[tokio::test]
-async fn test_codex_non_api_key_auth_uses_subscription_upstream_by_default() {
+async fn test_codex_account_header_selects_subscription_upstream() {
     let (upstream_url, _upstream_handle) = start_query_echo_upstream().await;
     let (proxy_url, _proxy_handle) = start_proxy(&upstream_url).await;
 
@@ -1887,6 +1970,7 @@ async fn test_codex_non_api_key_auth_uses_subscription_upstream_by_default() {
     let response = client
         .post(format!("{}/v1/responses", proxy_url))
         .header("authorization", "Bearer opaque-provider-token")
+        .header("chatgpt-account-id", "test-account")
         .body(clean_body)
         .send()
         .await
@@ -1894,6 +1978,21 @@ async fn test_codex_non_api_key_auth_uses_subscription_upstream_by_default() {
 
     let body = response.text().await.unwrap();
     assert_eq!(body, "/backend-api/codex/responses");
+}
+
+#[tokio::test]
+async fn test_codex_responses_allow_default_upstream_without_subscription_selection() {
+    let (upstream_url, _upstream_handle) = start_query_echo_upstream().await;
+    let (proxy_url, _proxy_handle) = start_proxy(&upstream_url).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for authorization in [None, Some("Bearer opaque-provider-token")] {
+        let mut request = client.post(format!("{proxy_url}/v1/responses"));
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "/v1/responses");
+    }
 }
 
 #[tokio::test]
@@ -1905,6 +2004,7 @@ async fn test_codex_subscription_forces_store_false() {
     let response = client
         .post(format!("{}/v1/responses", proxy_url))
         .header("authorization", "Bearer opaque-provider-token")
+        .header("chatgpt-account-id", "test-account")
         .header("content-type", "application/json")
         .body(r#"{"model":"gpt-5","input":"compact","store":true}"#)
         .send()
@@ -1932,6 +2032,7 @@ async fn test_codex_subscription_adds_store_false_when_missing() {
     let response = client
         .post(format!("{}/v1/responses", proxy_url))
         .header("authorization", "Bearer opaque-provider-token")
+        .header("chatgpt-account-id", "test-account")
         .header("content-type", "application/json")
         .body(r#"{"model":"gpt-5","input":"compact"}"#)
         .send()
@@ -1952,6 +2053,7 @@ async fn test_codex_subscription_forces_stream_true() {
     let response = client
         .post(format!("{}/v1/responses", proxy_url))
         .header("authorization", "Bearer opaque-provider-token")
+        .header("chatgpt-account-id", "test-account")
         .header("content-type", "application/json")
         .body(r#"{"model":"gpt-5","input":"compact","store":false,"stream":false}"#)
         .send()
@@ -1995,6 +2097,7 @@ async fn test_codex_subscription_preserves_compact_suffix() {
             proxy_url
         ))
         .header("authorization", "Bearer opaque-provider-token")
+        .header("chatgpt-account-id", "test-account")
         .body(r#"{"model":"gpt-5","input":[]}"#)
         .send()
         .await
@@ -2013,6 +2116,7 @@ async fn test_codex_subscription_compact_does_not_add_store_or_stream() {
     let response = client
         .post(format!("{}/backend-api/codex/responses/compact", proxy_url))
         .header("authorization", "Bearer opaque-provider-token")
+        .header("chatgpt-account-id", "test-account")
         .header("content-type", "application/json")
         .body(r#"{"model":"gpt-5","input":[]}"#)
         .send()
